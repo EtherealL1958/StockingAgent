@@ -1,0 +1,14 @@
+{
+  "name": "stocking-agent",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/**/*.test.js",
+    "start": "npm run build && node dist/src/index.js"
+  },
+  "dependencies": { "zod": "^3.25.76" },
+  "devDependencies": { "@types/node": "^22.15.30", "typescript": "^5.8.3" }
+}
