@@ -1,6 +1,6 @@
 export type RiskLevel = "low" | "medium" | "high";
 export type SecurityType = "stock" | "etf";
-export type Board = "sh_main" | "sz_main" | "chinext" | "star" | "etf";
+export type Board = "sh_main" | "sz_main" | "bj_main" | "chinext" | "star" | "etf";
 
 export interface InvestorProfile {
   readonly investableCash: number;

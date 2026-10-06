@@ -1,11 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { z } from "zod";
 import { ResearchAgent } from "../src/agent/runtime.js";
+import { SlidingWindowContextManager } from "../src/agent/context.js";
 import { RuleBasedResearchModel } from "../src/agent/rule-model.js";
+import { ChatCompletionsResearchModel } from "../src/agent/chat-completions-model.js";
+import { JsonlSessionStore } from "../src/agent/session.js";
 import { optimizePortfolio } from "../src/domain/portfolio.js";
 import type { Quote, Security } from "../src/domain/types.js";
 import { MockMarketDataProvider } from "../src/providers/market-data.js";
-import { marketTools } from "../src/tools/market-tools.js";
+import { buildMarketTools } from "../src/tools/market-tools.js";
+import { TavilyWebSearchProvider, type WebSearchInput } from "../src/providers/web-search.js";
+import { defineTool } from "../src/tools/tool.js";
 
 const security: Security = {
   ticker: "510300",
@@ -31,7 +40,7 @@ test("agent executes a narrow tool and emits a usable answer", async () => {
     new Map(),
   );
   const agent = new ResearchAgent(
-    marketTools(provider),
+    buildMarketTools(provider),
     new RuleBasedResearchModel(),
   );
   const events: string[] = [];
@@ -48,6 +57,192 @@ test("agent executes a narrow tool and emits a usable answer", async () => {
     "turn_start",
     "agent_end",
   ]);
+});
+
+test("agent returns provider failures as explicit incomplete evidence", async () => {
+  let sawError = false;
+  const failingTool = defineTool({
+    name: "failing_provider",
+    description: "测试工具",
+    input: z.object({}),
+    execute: async () => {
+      throw new Error("Data source unavailable");
+    },
+  });
+  const agent = new ResearchAgent([failingTool], {
+    respond: async messages => {
+      const last = messages.at(-1);
+      if (last?.role === "user") return { done: false, toolCall: { id: "call-1", name: "failing_provider", input: {} } };
+      if (last?.role === "tool") {
+        const result = JSON.parse(last.content) as { available?: boolean; error?: { message?: string } };
+        sawError = result.available === false && result.error?.message === "Data source unavailable";
+        return { done: true, content: sawError ? "财务数据不可用，分析不完整" : "错误未被保留" };
+      }
+      return { done: true, content: "未收到工具结果" };
+    },
+  });
+  const result = await agent.run("查询财务数据");
+  assert.equal(sawError, true);
+  assert.match(result.answer, /数据不可用/);
+});
+
+test("agent leaves a final synthesis turn after repeated tool calls", async () => {
+  const tool = defineTool({
+    name: "step",
+    description: "测试步骤工具",
+    input: z.object({ step: z.number().int().positive() }),
+    execute: async ({ step }) => ({ step, available: true }),
+  });
+  const agent = new ResearchAgent([tool], {
+    respond: async messages => {
+      const toolCalls = messages.filter(message => message.role === "tool").length;
+      if (toolCalls < 8) {
+        return { done: false, toolCall: { id: `call-${toolCalls + 1}`, name: "step", input: { step: toolCalls + 1 } } };
+      }
+      return { done: true, content: "已完成多步研究并生成总结" };
+    },
+  });
+
+  const result = await agent.run("执行多步研究");
+  assert.match(result.answer, /生成总结/);
+});
+
+test("invalid tool input is returned as concise actionable validation feedback", async () => {
+  let validationMessage = "";
+  const tool = defineTool({
+    name: "strict_tool",
+    description: "测试严格参数",
+    input: z.object({ language: z.enum(["javascript", "python"]), code: z.string().min(1) }),
+    execute: async () => ({ available: true }),
+  });
+  const agent = new ResearchAgent([tool], {
+    respond: async messages => {
+      const last = messages.at(-1);
+      if (last?.role === "user") {
+        return { done: false, toolCall: { id: "call-invalid", name: "strict_tool", input: { language: "javascript>\\nconsole.log(1)" } } };
+      }
+      if (last?.role === "tool") {
+        const payload = JSON.parse(last.content) as { error?: { message?: string } };
+        validationMessage = payload.error?.message ?? "";
+      }
+      return { done: true, content: "已收到参数错误" };
+    },
+  });
+
+  const result = await agent.run("测试错误参数");
+  assert.match(result.answer, /参数错误/);
+  assert.match(validationMessage, /language:/);
+  assert.match(validationMessage, /code:/);
+  assert.doesNotMatch(validationMessage, /received\":/);
+});
+
+test("JSONL session restores static context and dynamic message history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-session-"));
+  const staticContext = {
+    systemPrompt: "风险优先研究 Agent",
+    toolDefinitions: [{ name: "get_quote", description: "获取报价", parameters: { type: "object" } }],
+  };
+  try {
+    const first = await JsonlSessionStore.open({ cwd: directory, directory, staticContext });
+    await first.append({ role: "user", content: "分析 600519" });
+    await first.append({ role: "assistant", content: "我会先读取行情。", toolName: "get_quote", toolInput: { ticker: "600519" }, toolCallId: "call-1" });
+    await first.append({ role: "tool", content: JSON.stringify({ quote: { price: 1200 } }), toolName: "get_quote", toolInput: { ticker: "600519" }, toolCallId: "call-1" });
+
+    const resumed = await JsonlSessionStore.open({ cwd: directory, directory, staticContext });
+    assert.equal(resumed.id, first.id);
+    assert.deepEqual(resumed.staticContext, staticContext);
+    assert.equal(resumed.history.length, 3);
+    assert.equal(resumed.history[2]?.toolCallId, "call-1");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("agent sends restored history while keeping the full session persisted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-agent-session-"));
+  const staticContext = { systemPrompt: "测试", toolDefinitions: [] };
+  try {
+    const session = await JsonlSessionStore.open({ cwd: directory, directory, staticContext });
+    await session.append({ role: "user", content: "之前的问题" });
+    await session.append({ role: "assistant", content: "之前的结论" });
+    let seenMessages = 0;
+    const agent = new ResearchAgent([], {
+      respond: async messages => {
+        seenMessages = messages.length;
+        return { done: true, content: "已结合历史回答" };
+      },
+    }, { session });
+
+    const result = await agent.run("继续分析");
+    assert.match(result.answer, /结合历史/);
+    assert.equal(seenMessages, 3);
+    assert.equal(session.history.length, 4);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("context manager trims only the model projection, not persisted history", () => {
+  const history = [
+    { role: "user" as const, content: "旧问题" },
+    { role: "assistant" as const, content: "旧回答" },
+    { role: "user" as const, content: "新问题" },
+    { role: "assistant" as const, content: "新回答" },
+  ];
+  const manager = new SlidingWindowContextManager({ maxCharacters: 80, keepRecentMessages: 2 });
+  const projected = manager.build(history);
+  assert.equal(projected[0]?.role, "system");
+  assert.match(projected[0]?.content ?? "", /已省略较早/);
+  assert.deepEqual(projected.slice(-2), history.slice(-2));
+  assert.equal(history.length, 4);
+});
+
+test("Chat Completions model streams public reasoning and text deltas", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const stream = [
+    'data: {"choices":[{"delta":{"reasoning_content":"先检查数据。"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"结论"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const model = new ChatCompletionsResearchModel({
+    apiKey: "test-key",
+    model: "test-model",
+    baseUrl: "https://example.test/v1",
+    systemPrompt: "测试",
+    fetchFn: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  }, []);
+  const thinking: string[] = [];
+  const text: string[] = [];
+  const response = await model.respond([{ role: "user", content: "测试" }], {
+    onThinkingDelta: delta => thinking.push(delta),
+    onTextDelta: delta => text.push(delta),
+  });
+
+  assert.equal(requestBody?.stream, true);
+  assert.deepEqual(thinking, ["先检查数据。"]);
+  assert.deepEqual(text, ["结论"]);
+  assert.deepEqual(response, { done: true, content: "结论" });
+});
+
+test("Chat Completions model reconstructs streamed tool call arguments", async () => {
+  const stream = [
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"get_quote","arguments":"{\\"ticker\\":\\"600519\\""}}]}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}\n\n',
+    "data: [DONE]\n\n",
+  ].join("");
+  const model = new ChatCompletionsResearchModel({
+    apiKey: "test-key",
+    model: "test-model",
+    systemPrompt: "测试",
+    fetchFn: async () => new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+  }, []);
+  const response = await model.respond([{ role: "user", content: "报价" }], {});
+
+  assert.equal(response.done, false);
+  assert.deepEqual(response.toolCall, { id: "call-1", name: "get_quote", input: { ticker: "600519" } });
 });
 
 test("optimizer rejects an unaffordable stock", () => {
@@ -80,26 +275,46 @@ test("HiThink provider validates and normalizes snapshot responses", async () =>
   const { HiThinkMarketDataProvider } = await import("../src/providers/hithink-market-data.js");
   const provider = new HiThinkMarketDataProvider({
     apiKey: "test-key",
-    fetchFn: async () => new Response(JSON.stringify({
-      code: 0,
-      message: "success",
-      request_id: "request-1",
-      data: {
-        timestamp: 1735689600000,
-        total: 1,
-        item: [{
-          thscode: "600519.SH",
-          ticker: "600519",
-          last_price: 1200,
-          open_price: 1190,
-          high_price: 1210,
-          low_price: 1180,
-          prev_price: 1185,
-          volume: 100,
-          turnover: 120000,
-        }],
-      },
-    }), { status: 200 }),
+    fetchFn: async input => {
+      const url = String(input);
+      const body = url.includes("/meta/tickers/search")
+        ? {
+            code: 0,
+            message: "success",
+            request_id: "request-symbol",
+            data: {
+              timestamp: 1735689600000,
+              item: [{
+                thscode: "600519.SH",
+                ticker: "600519",
+                name: "贵州茅台",
+                exchange: "SH",
+                asset_type: "a-share",
+              }],
+            },
+          }
+        : {
+            code: 0,
+            message: "success",
+            request_id: "request-1",
+            data: {
+              timestamp: 1735689600000,
+              total: 1,
+              item: [{
+                thscode: "600519.SH",
+                ticker: "600519",
+                last_price: 1200,
+                open_price: 1190,
+                high_price: 1210,
+                low_price: 1180,
+                prev_price: 1185,
+                volume: 100,
+                turnover: 120000,
+              }],
+            },
+          };
+      return new Response(JSON.stringify(body), { status: 200 });
+    },
   });
 
   const quote = await provider.getQuote("600519");
@@ -124,6 +339,25 @@ test("HiThink provider exposes business errors instead of treating them as data"
     () => provider.getQuote("600519"),
     (error: unknown) => error instanceof HiThinkApiError && error.code === 1001 && error.requestId === "request-2",
   );
+});
+
+test("HiThink provider distinguishes STAR and ChiNext board trading lots", async () => {
+  const { HiThinkMarketDataProvider } = await import("../src/providers/hithink-market-data.js");
+  const provider = new HiThinkMarketDataProvider({
+    apiKey: "test-key",
+    fetchFn: async () => new Response(JSON.stringify({
+      code: 0,
+      message: "success",
+      request_id: "request-board",
+      data: {
+        timestamp: 1735689600000,
+        item: [{ thscode: "688836.SH", ticker: "688836", name: "宇树科技-W", exchange: "SH", asset_type: "a-share" }],
+      },
+    }), { status: 200 }),
+  });
+  const security = (await provider.getStockBasic("688836"))[0];
+  assert.equal(security?.board, "star");
+  assert.equal(security?.lotSize, 200);
 });
 
 test("price analytics calculate period return, moving averages and drawdown", async () => {
@@ -185,4 +419,29 @@ test("score keeps incomplete financial data incomplete", async () => {
   const score = scoreSecurity({});
   assert.equal(score.total, undefined);
   assert.equal(score.completeness, 0);
+});
+
+test("Tavily provider preserves the unified search contract and reports provider mappings", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const provider = new TavilyWebSearchProvider({
+    apiKey: "test-key",
+    fetchFn: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        results: [{ title: "公告", url: "https://example.com", content: "摘要", published_date: "2026-10-01", score: 0.9 }],
+      }), { status: 200 });
+    },
+  });
+  const input: WebSearchInput = { query: "贵州茅台 年报", count: 3, freshness: "pw", searchLang: "zh-hans" };
+  const result = await provider.search(input);
+  assert.equal(result.provider, "tavily");
+  assert.equal(result.available, true);
+  assert.deepEqual(result.request, input);
+  assert.deepEqual(result.diagnostics.unsupportedInput, []);
+  assert.equal(result.diagnostics.providerRequest.time_range, "week");
+  assert.equal(result.diagnostics.providerRequest.language, "zh-cn");
+  assert.equal(requestBody?.max_results, 3);
+  assert.equal(requestBody?.language, "zh-cn");
+  assert.equal(requestBody?.api_key, undefined);
+  assert.equal(result.results[0]?.publishedAt, "2026-10-01");
 });

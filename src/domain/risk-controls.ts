@@ -124,7 +124,7 @@ export function evaluatePortfolioRisk(
 
 export interface AShareOrderContext {
   readonly side: OrderSide;
-  readonly board: "sh_main" | "sz_main" | "chinext" | "star" | "etf";
+  readonly board: "sh_main" | "sz_main" | "bj_main" | "chinext" | "star" | "etf";
   readonly isST: boolean;
   readonly referenceClose?: number;
   readonly orderPrice: number;
@@ -156,7 +156,9 @@ export function validateAShareOrder(context: AShareOrderContext): readonly Order
       ? 0.05
       : context.board === "chinext" || context.board === "star"
         ? 0.20
-        : 0.10;
+        : context.board === "bj_main"
+          ? 0.30
+          : 0.10;
     const lowerBound = context.referenceClose * (1 - limitRate);
     const upperBound = context.referenceClose * (1 + limitRate);
     if (context.orderPrice < lowerBound || context.orderPrice > upperBound) {

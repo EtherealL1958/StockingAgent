@@ -42,6 +42,21 @@ const snapshotDataSchema = z.object({
   })),
 });
 
+const fundSnapshotDataSchema = z.object({
+  timestamp: z.number().nullable(),
+  item: z.array(z.object({
+    thscode: z.string(),
+    ticker: z.string(),
+    last_price: z.number(),
+    open_price: z.number(),
+    high_price: z.number(),
+    low_price: z.number(),
+    prev_price: z.number(),
+    volume: z.number(),
+    turnover: z.number(),
+  })),
+});
+
 const historicalDataSchema = z.object({
   timestamp: z.number(),
   item: z.array(z.object({
@@ -93,7 +108,6 @@ export interface HiThinkMarketDataOptions {
   readonly apiKey: string;
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
-  readonly financialReport?: string;
   readonly fetchFn?: FetchFunction;
 }
 
@@ -119,10 +133,14 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
 
   public async getQuote(ticker: string): Promise<Quote> {
     const thscode = this.toThscode(ticker);
-    const response = await this.request("/api/a-share/prices/snapshot", {
-      thscodes: thscode,
-    });
-    const data = snapshotDataSchema.parse(response.data);
+    const isEtf = await this.isEtf(ticker);
+    const response = await this.request(
+      isEtf ? "/api/fund/market/snapshot" : "/api/a-share/prices/snapshot",
+      isEtf ? { thscode } : { thscodes: thscode },
+    );
+    const data = isEtf
+      ? fundSnapshotDataSchema.parse(response.data)
+      : snapshotDataSchema.parse(response.data);
     const item = data.item.find(snapshot => snapshot.thscode === thscode);
     if (!item) {
       throw new HiThinkApiError(`未找到行情: ${thscode}`, 404, response.requestId);
@@ -140,6 +158,25 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     };
   }
 
+  public async getQuotes(tickers: readonly string[]): Promise<readonly Quote[]> {
+    if (tickers.length === 0) return [];
+    const response = await this.request("/api/a-share/prices/snapshot", {
+      thscodes: tickers.map(ticker => this.toThscode(ticker)).join(","),
+    });
+    const data = snapshotDataSchema.parse(response.data);
+    const timestamp = data.timestamp;
+    if (timestamp === null) {
+      throw new HiThinkApiError("批量行情缺少数据时间", 5004, response.requestId);
+    }
+    return data.item.map(item => ({
+      ticker: item.ticker,
+      price: item.last_price,
+      asOf: this.timestampToIso(timestamp),
+      source: "hithink-finance",
+      isSuspended: item.volume === 0 && item.last_price === 0,
+    }));
+  }
+
   public async getDailyBars(
     ticker: string,
     from?: string,
@@ -149,13 +186,17 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     const start = from
       ? this.parseDate(from)
       : new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
-    const response = await this.request("/api/a-share/prices/historical", {
-      thscode: this.toThscode(ticker),
-      interval: "1d",
+    const isEtf = await this.isEtf(ticker);
+    const response = await this.request(
+      isEtf ? "/api/fund/market/historical" : "/api/a-share/prices/historical",
+      {
+        thscode: this.toThscode(ticker),
+        interval: "1d",
       start: String(start.getTime()),
       end: String(end.getTime()),
-      adjust: "forward",
-    });
+        adjust: "forward",
+      },
+    );
     const data = historicalDataSchema.parse(response.data);
     return data.item.map(bar => ({
       ticker,
@@ -168,14 +209,37 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     }));
   }
 
-  public async getFinancials(ticker: string, report?: string): Promise<FinancialMetrics> {
-    const selectedReport = report ?? this.options.financialReport;
-    if (!selectedReport) {
-      throw new Error("查询财务指标必须提供 report，例如 2025-4");
-    }
+  public async getIndexDailyBars(
+    thscode: string,
+    from?: string,
+    to?: string,
+  ): Promise<readonly DailyBar[]> {
+    const end = to ? this.parseDate(to) : new Date();
+    const start = from
+      ? this.parseDate(from)
+      : new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
+    const response = await this.request("/api/a-share-index/prices/historical", {
+      thscode: this.normalizeIndexCode(thscode),
+      interval: "1d",
+      start: String(start.getTime()),
+      end: String(end.getTime()),
+    });
+    const data = historicalDataSchema.parse(response.data);
+    return data.item.map(bar => ({
+      ticker: thscode,
+      date: this.timestampToDate(bar.date_ms),
+      open: bar.open_price,
+      high: bar.high_price,
+      low: bar.low_price,
+      close: bar.close_price,
+      volume: bar.volume,
+    }));
+  }
+
+  public async getFinancials(ticker: string, report: string): Promise<FinancialMetrics> {
     const response = await this.request("/api/a-share/financials/indicators", {
       thscode: this.toThscode(ticker),
-      report: selectedReport,
+      report,
     });
     const data = financialDataSchema.parse(response.data);
     const values = new Map<string, number>();
@@ -227,6 +291,14 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     }
   }
 
+  private async isEtf(ticker: string): Promise<boolean> {
+    const securities = await this.getStockBasic(ticker);
+    if (securities.length === 0) {
+      throw new HiThinkApiError(`未找到证券: ${ticker}`, 404);
+    }
+    return securities[0]!.securityType === "etf";
+  }
+
   private async request(
     path: string,
     params: Readonly<Record<string, string>>,
@@ -263,6 +335,13 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     return envelope;
   }
 
+  private normalizeIndexCode(thscode: string): string {
+    if (/^\d{6}\.(SH|SZ|TI)$/i.test(thscode)) {
+      return thscode.toUpperCase();
+    }
+    throw new Error(`指数代码必须包含 SH、SZ 或 TI 后缀: ${thscode}`);
+  }
+
   private toThscode(ticker: string): string {
     if (/^\d{6}\.(SH|SZ)$/i.test(ticker)) {
       return ticker.toUpperCase();
@@ -275,6 +354,9 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     }
     if (ticker.startsWith("0") || ticker.startsWith("1") || ticker.startsWith("2") || ticker.startsWith("3")) {
       return `${ticker}.SZ`;
+    }
+    if (ticker.startsWith("4") || ticker.startsWith("8") || ticker.startsWith("9")) {
+      return `${ticker}.BJ`;
     }
     throw new Error(`暂不支持自动推断交易所的证券代码: ${ticker}`);
   }
@@ -308,18 +390,27 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
 
   private toSecurity(item: z.infer<typeof tickerDataSchema>["item"][number]): Security {
     const isEtf = item.asset_type === "fund-etf";
-    if (!isEtf && item.exchange !== "SH" && item.exchange !== "SZ") {
+    if (!isEtf && item.exchange !== "SH" && item.exchange !== "SZ" && item.exchange !== "BJ") {
       throw new Error(`无法识别证券交易所: ${item.thscode}`);
     }
-    const board = isEtf ? "etf" : item.exchange === "SH" ? "sh_main" : "sz_main";
+    const board = isEtf ? "etf" : this.inferBoard(item.ticker, item.exchange);
     return {
       ticker: item.ticker,
       name: item.name,
       securityType: isEtf ? "etf" : "stock",
       board,
       sector: isEtf ? "etf" : "unknown",
-      lotSize: 100,
+      lotSize: board === "star" || board === "chinext" ? 200 : 100,
       isIndex: false,
     };
+  }
+
+  private inferBoard(ticker: string, exchange: string | null): "sh_main" | "sz_main" | "bj_main" | "chinext" | "star" {
+    if (exchange === "BJ") return "bj_main";
+    if (exchange === "SH" && ticker.startsWith("688")) return "star";
+    if (exchange === "SZ" && ticker.startsWith("300")) return "chinext";
+    if (exchange === "SH") return "sh_main";
+    if (exchange === "SZ") return "sz_main";
+    throw new Error(`无法识别证券交易所: ${ticker}.${exchange ?? "UNKNOWN"}`);
   }
 }

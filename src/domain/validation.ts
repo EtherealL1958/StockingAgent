@@ -26,7 +26,7 @@ export function parseSecurity(value: unknown): Security {
     ticker: z.string().min(1),
     name: z.string().min(1),
     securityType: z.enum(["stock", "etf"]),
-    board: z.enum(["sh_main", "sz_main", "chinext", "star", "etf"]),
+    board: z.enum(["sh_main", "sz_main", "bj_main", "chinext", "star", "etf"]),
     sector: z.string().min(1),
     lotSize: z.number().int().positive(),
     isIndex: z.boolean(),
