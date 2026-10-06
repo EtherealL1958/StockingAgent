@@ -64,9 +64,11 @@ export interface ResearchAgentOptions {
 }
 
 export type AgentEvent = {
-  readonly type: "agent_start" | "turn_start" | "thinking_delta" | "text_delta" | "tool_start" | "tool_end" | "agent_end";
+  readonly type: "agent_start" | "turn_start" | "response_end" | "thinking_delta" | "text_delta" | "tool_start" | "tool_end" | "agent_end";
+  readonly final?: boolean;
   readonly message?: AgentMessage;
   readonly toolName?: string;
+  readonly toolCallId?: string;
   readonly input?: unknown;
   readonly delta?: string;
   readonly result?: unknown;
@@ -146,6 +148,11 @@ export class ResearchAgent {
       });
 
       const requestedToolCalls = response.toolCalls ?? (response.toolCall ? [response.toolCall] : []);
+      this.emit({
+        type: "response_end",
+        message: { role: "assistant", content: response.content ?? "" },
+        final: response.done || requestedToolCalls.length === 0,
+      });
       if (response.done || requestedToolCalls.length === 0) {
         if (response.content) {
           await this.appendMessage({ role: "assistant", content: response.content });
@@ -174,7 +181,7 @@ export class ResearchAgent {
         const tool = this.tools.get(toolCall.name);
         if (!tool) {
           const result = toolError("unknown_tool", new Error(`未知工具: ${toolCall.name}`));
-          this.emit({ type: "tool_end", toolName: toolCall.name, result });
+          this.emit({ type: "tool_end", toolName: toolCall.name, toolCallId: toolCall.id, input: toolCall.input, result });
           await this.appendToolResult(toolCall, result);
           continue;
         }
@@ -184,11 +191,11 @@ export class ResearchAgent {
           input = tool.input.parse(toolCall.input);
         } catch (error) {
           const result = toolError("invalid_tool_input", error);
-          this.emit({ type: "tool_end", toolName: tool.name, result });
+          this.emit({ type: "tool_end", toolName: tool.name, toolCallId: toolCall.id, input: toolCall.input, result });
           await this.appendToolResult({ ...toolCall, input: toolCall.input }, result);
           continue;
         }
-        this.emit({ type: "tool_start", toolName: tool.name, input });
+        this.emit({ type: "tool_start", toolName: tool.name, toolCallId: toolCall.id, input });
         let result: unknown;
         try {
           result = await tool.execute(input, {
@@ -198,7 +205,7 @@ export class ResearchAgent {
           // Provider 错误是证据缺失，不是金融结论；将其交回模型让它明确报告不完整性。
           result = toolError("tool_execution_error", error);
         }
-        this.emit({ type: "tool_end", toolName: tool.name, result });
+        this.emit({ type: "tool_end", toolName: tool.name, toolCallId: toolCall.id, input, result });
         await this.appendToolResult({ ...toolCall, input }, result);
         const userResponse = tool.userResponse?.(result);
         if (userResponse) directResponses.push(userResponse);

@@ -54,9 +54,11 @@ test("agent executes a narrow tool and emits a usable answer", async () => {
   assert.deepEqual(events, [
     "agent_start",
     "turn_start",
+    "response_end",
     "tool_start",
     "tool_end",
     "turn_start",
+    "response_end",
     "agent_end",
   ]);
 });

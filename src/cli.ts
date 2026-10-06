@@ -3,7 +3,7 @@ import "dotenv/config";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { dirname, join } from "node:path";
-import { ChatCompletionsResearchModel, buildSessionToolDefinitions } from "./agent/chat-completions-model.js";
+import { ChatCompletionsResearchModel, buildSessionToolDefinitions, reasoningEffortSchema } from "./agent/chat-completions-model.js";
 import { SlidingWindowContextManager } from "./agent/context.js";
 import { discoverSkills, formatSkillCatalog } from "./agent/resources.js";
 import { RuleBasedResearchModel } from "./agent/rule-model.js";
@@ -15,8 +15,10 @@ import { buildMarketTools } from "./tools/market-tools.js";
 import { buildGeneralTools } from "./tools/general-tools.js";
 import { buildUserMemoryTools } from "./tools/user-memory-tools.js";
 import { JsonUserProfileStore } from "./memory/user-profile.js";
+import { runTerminalUi } from "./ui/terminal-ui.js";
+import type { TerminalMetadata } from "./ui/status-bar.js";
 
-async function createResearchAgent(provider: MarketDataProvider): Promise<{ readonly agent: ResearchAgent; readonly session: JsonlSessionStore }> {
+async function createResearchAgent(provider: MarketDataProvider): Promise<{ readonly agent: ResearchAgent; readonly session: JsonlSessionStore; readonly metadata: TerminalMetadata }> {
   const profileStore = await JsonUserProfileStore.open({
     cwd: process.cwd(),
     ...(process.env.STOCKING_PROFILE_FILE ? { filePath: process.env.STOCKING_PROFILE_FILE } : {}),
@@ -35,6 +37,15 @@ async function createResearchAgent(provider: MarketDataProvider): Promise<{ read
     staticContext,
   });
   const apiKey = process.env.LLM_KEY;
+  const reasoningEffort = process.env.LLM_REASONING_EFFORT
+    ? reasoningEffortSchema.parse(process.env.LLM_REASONING_EFFORT)
+    : undefined;
+  const metadata: TerminalMetadata = {
+    modelName: apiKey ? process.env.LLM_MODEL ?? "deepseek-chat" : "规则模型（演示）",
+    reasoningEffort: apiKey ? reasoningEffort ? `${reasoningEffort}（请求值）` : "供应商默认" : "不适用",
+    sessionId: session.id,
+    sessionFile: session.filePath,
+  };
   if (apiKey) {
     console.log(`使用真实 LLM：${process.env.LLM_MODEL ?? "deepseek-chat"}`);
     const configuredContextWindow = readPositiveInteger(process.env.LLM_CONTEXT_WINDOW);
@@ -43,9 +54,10 @@ async function createResearchAgent(provider: MarketDataProvider): Promise<{ read
       model: process.env.LLM_MODEL ?? "deepseek-chat",
       baseUrl: process.env.LLM_API || "https://api.deepseek.com",
       systemPrompt,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       ...(configuredContextWindow ? { contextWindow: configuredContextWindow } : {}),
     }, tools);
-    return { session, agent: new ResearchAgent(tools, model, {
+    return { session, metadata, agent: new ResearchAgent(tools, model, {
       session,
       contextManager: createContextManager(model.contextWindow, session.filePath),
       dynamicContextProvider: () => profileStore.toPromptContext(),
@@ -54,7 +66,7 @@ async function createResearchAgent(provider: MarketDataProvider): Promise<{ read
   }
   console.log("未配置 LLM_KEY，使用规则模型；自然语言分析能力受限");
   const model = new RuleBasedResearchModel();
-  return { session, agent: new ResearchAgent(tools, model, {
+  return { session, metadata, agent: new ResearchAgent(tools, model, {
     session,
     contextManager: createContextManager(model.contextWindow, session.filePath),
     dynamicContextProvider: () => profileStore.toPromptContext(),
@@ -75,7 +87,15 @@ function createContextManager(contextWindow: number, sessionFilePath: string): S
 }
 
 export async function runTerminal(provider: MarketDataProvider = createMarketDataProvider()): Promise<void> {
-  const { agent, session } = await createResearchAgent(provider);
+  const { agent, session, metadata } = await createResearchAgent(provider);
+  if (input.isTTY && output.isTTY && process.env.TERM !== "dumb" && !process.argv.includes("--plain")) {
+    await runTerminalUi(agent, metadata, session.history);
+    return;
+  }
+  await runPlainTerminal(agent, session);
+}
+
+async function runPlainTerminal(agent: ResearchAgent, session: JsonlSessionStore): Promise<void> {
   let streamedText = false;
   let activeOutput: "thinking" | "answer" | undefined;
 
@@ -86,7 +106,7 @@ export async function runTerminal(provider: MarketDataProvider = createMarketDat
     }
   };
 
-  agent.on(event => {
+  const unsubscribe = agent.on(event => {
     if (event.type === "thinking_delta" && event.delta) {
       if (activeOutput !== "thinking") {
         finishOutputBlock();
@@ -158,6 +178,7 @@ export async function runTerminal(provider: MarketDataProvider = createMarketDat
       }
     }
   } finally {
+    unsubscribe();
     terminal.close();
   }
 }

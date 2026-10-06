@@ -9,6 +9,7 @@
 - `src/agent/resources.ts`：扫描 Skill 的 frontmatter，只把名称、用途和路径放入上下文；完整 Skill 由 Agent 通过 `read` 按需加载。
 - `skills/`：面向个人投资者的渐进式专业 Skill。`a-share-research` 负责总路由；`a-share-market-data`、`a-share-technical-analysis`、`a-share-earnings-analysis`、`a-share-comparables`、`a-share-sector-overview`、`a-share-thesis-tracker` 和 `a-share-catalyst-calendar` 分别负责数据质量、行情指标、财报、同行比较、行业、投资逻辑和事件日历。
 - `src/cli.ts`：终端交互入口，支持行情、历史、指标分析和研究摘要。
+- `src/ui`：独立 TUI 展示层，只订阅 Agent 事件，负责会话卡片、多行输入与状态栏，不参与工具执行和金融计算。
 - `src/tools`：通用工具（`read`、`write`、`web_search`、`code_exec`）和四个金融工具（`get_quote`、`get_market_history`、`get_fundamentals`、`screen_stocks`）。
 - `src/providers`：`MarketDataProvider` 统一数据边界。
   - `MockMarketDataProvider`：固定 fixture，只用于测试和无密钥演示。
@@ -26,11 +27,14 @@
 
 ## 运行
 
+需要 Node.js **22.19.0 或更高版本**。
+
 ```bash
 npm install
 npm run typecheck
 npm test
 npm start       # 进入交互终端
+npm start -- --plain # 使用纯文本终端；管道和非 TTY 环境自动使用此模式
 npm run demo    # 执行一次 Agent 工具调用演示
 ```
 
@@ -78,7 +82,13 @@ BRAVE_SEARCH_API=https://api.search.brave.com/res/v1/web/search
 复盘 600519 最近一年的表现，并说明原有投资逻辑可能在哪些情况下失效
 ```
 
-配置真实 LLM 后，终端会使用 Chat Completions 的 SSE 流式响应：模型文本会边生成边显示，工具调用会显示工具名和经过校验的参数，例如 `[tool:start] get_quote {"ticker":"600519"}`，工具完成后显示 `[tool:end] ... ok` 或明确的错误。若模型供应商公开发送 `reasoning_content` 或 `reasoning` 字段，终端会以 `[model-thinking]` 增量显示这些供应商提供的进度信息；供应商没有公开该字段时不会伪造“思考过程”。
+交互终端默认使用 TUI：顶部为应用标题，中间为可滚动会话区，底部固定多行输入框和状态栏。用户消息、模型公开推理、调用工具前的过程说明、工具执行与最终回答分别渲染；回答支持 Markdown 表格和代码块。工具卡片显示参数、完成/失败状态与执行耗时，可展开结果。状态栏显示模型名、思考强度配置、当前阶段、本次请求的执行时间、模型回合数、工具次数与会话编号。
+
+`LLM_REASONING_EFFORT` 可选 `low`、`medium`、`high`，设置后原样发送为 Chat Completions 的 `reasoning_effort`；仅适用于支持该参数的 API。状态栏将其标为“请求值”，未配置时显示“供应商默认”，规则模型显示“不适用”。不会从模型名或公开推理文本猜测强度，也不会静默降级不受支持的参数。
+
+模型通过 SSE 流式更新各卡片。思考区只展示供应商公开返回的 `reasoning_content` 或 `reasoning`；没有该字段时不伪造推理。当前 JSONL 不保存这些增量推理，恢复会话时仅还原已持久化的用户消息、模型文本和工具调用/结果。显示折叠和工具结果预览不修改会话或模型上下文。纯文本模式保留 `[model-thinking]`、`[tool:start]` 与 `[tool:end]` 日志。
+
+TUI 复用 pi 的独立组件库 [`@earendil-works/pi-tui`](https://github.com/earendil-works/pi/tree/main/packages/tui)，参考其 [`assistant-message.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/interactive/components/assistant-message.ts)、[`tool-execution.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/interactive/components/tool-execution.ts) 和 [`footer.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/interactive/components/footer.ts) 的职责划分；Claude Code 部分参考官方[状态栏](https://code.claude.com/docs/en/statusline)与[交互模式](https://code.claude.com/docs/en/interactive-mode)文档，其公开仓库不包含完整 TUI 渲染器源码。项目保留自己的 Agent runtime，不引入完整 Agent 框架。
 
 ## 会话与上下文
 
@@ -148,6 +158,17 @@ LLM 启动时只看到 Skill 的名称、用途和文件路径。模型需要完
 筛选最新价格不高于 100 元的 A 股股票
 ```
 
-终端不提供斜杠指令。输入 `exit` 或 `quit` 结束会话；每次研究输出包含数据源、时间窗口和“非投资建议”说明。
+TUI 快捷键与本地指令：
+
+| 操作 | 按键/指令 |
+| --- | --- |
+| 发送 / 换行 | Enter / Shift+Enter 或 Ctrl+J |
+| 输入历史 | ↑ / ↓ |
+| 折叠公开推理 / 展开工具结果 | Ctrl+T / Ctrl+O |
+| 浏览会话 / 回到最新 | PageUp、PageDown、鼠标滚轮 / Ctrl+End |
+| 帮助 / 模型与会话状态 | `/help` / `/status` |
+| 退出 | `/exit`、`exit`、`quit`、Ctrl+C，或空输入时 Ctrl+D |
+
+执行中可以编辑下一条草稿，但不能并发提交；Ctrl+C 请求在本轮结束并保存会话后退出。模型或工具失败会单独显示，输入框恢复可用。上述斜杠指令仅影响 TUI，不发送给 LLM；纯文本模式仍支持 `exit` 和 `quit`。
 
 默认规则模型不猜测缺失数据。接入 LLM 时实现 `AgentModel` 即可，LLM 只负责决定需要哪些工具和解释结果，不能替代财务计算或绕过风险规则。

@@ -4,7 +4,7 @@ export class RuleBasedResearchModel implements AgentModel {
   public readonly contextWindow = Number.POSITIVE_INFINITY;
 
   public async respond(messages: readonly AgentMessage[]): Promise<ModelResponse> {
-    const lastMessage = messages[messages.length - 1];
+    const lastMessage = [...messages].reverse().find(message => message.role !== "system");
     if (!lastMessage) {
       return { done: true, content: "没有输入" };
     }

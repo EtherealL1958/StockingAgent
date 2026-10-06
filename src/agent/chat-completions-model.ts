@@ -3,6 +3,9 @@ import type { AgentMessage, AgentModel, AgentResponseCallbacks, ModelResponse, M
 import type { SessionToolDefinition } from "./session.js";
 import type { AgentTool } from "../tools/tool.js";
 
+export const reasoningEffortSchema = z.enum(["low", "medium", "high"]);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+
 const chatCompletionResponseSchema = z.object({
   choices: z.array(z.object({
     message: z.object({
@@ -76,6 +79,8 @@ export interface ChatCompletionsModelOptions {
   readonly baseUrl?: string;
   readonly systemPrompt: string;
   readonly timeoutMs?: number;
+  /** Opt-in compatible API parameter; omit to retain the provider default. */
+  readonly reasoningEffort?: ReasoningEffort;
   /** 当前模型的上下文窗口，单位为 token；由模型配置提供。 */
   readonly contextWindow?: number;
   /** 仅用于注入测试或自定义运行时；生产环境默认使用全局 fetch。 */
@@ -167,6 +172,7 @@ export class ChatCompletionsResearchModel implements AgentModel {
       ],
       tools: this.tools,
       tool_choice: "auto",
+      ...(this.modelOptions.reasoningEffort ? { reasoning_effort: this.modelOptions.reasoningEffort } : {}),
       ...(stream ? { stream: true } : {}),
     };
   }
