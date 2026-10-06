@@ -189,7 +189,7 @@ test("context manager trims only the model projection, not persisted history", (
     { role: "user" as const, content: "新问题" },
     { role: "assistant" as const, content: "新回答" },
   ];
-  const manager = new SlidingWindowContextManager({ maxCharacters: 80, keepRecentMessages: 2 });
+  const manager = new SlidingWindowContextManager({ contextWindow: 30, reserveTokens: 4, keepRecentTokens: 12 });
   const projected = manager.build(history);
   assert.equal(projected[0]?.role, "system");
   assert.match(projected[0]?.content ?? "", /已省略较早/);

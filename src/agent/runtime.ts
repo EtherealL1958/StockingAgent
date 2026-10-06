@@ -22,6 +22,8 @@ export interface ModelResponse {
 }
 
 export interface AgentModel {
+  /** 模型可接受的最大上下文窗口，单位为 token。 */
+  readonly contextWindow?: number;
   respond(messages: readonly AgentMessage[], callbacks?: AgentResponseCallbacks): Promise<ModelResponse>;
 }
 

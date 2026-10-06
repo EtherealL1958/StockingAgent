@@ -1,6 +1,8 @@
 import type { AgentMessage, AgentModel, ModelResponse } from "./runtime.js";
 
 export class RuleBasedResearchModel implements AgentModel {
+  public readonly contextWindow = Number.POSITIVE_INFINITY;
+
   public async respond(messages: readonly AgentMessage[]): Promise<ModelResponse> {
     const lastMessage = messages[messages.length - 1];
     if (!lastMessage) {

@@ -3,7 +3,21 @@ name: a-share-research
 summary: A 股研究、复盘和风险优先的策略分析规范
 ---
 
-# A 股研究规范
+# 个人投资者 A 股研究规范
+
+本 Skill 是总路由，适用于个人投资者的行情分析、个股研究、选股、组合复盘和交易纪律检查。它不负责替代专业 Skill 中的具体计算规则；当任务涉及下列主题时，先用 `read` 读取对应文件，再调用窄接口工具获取证据：
+
+| 任务 | 按需读取 |
+| --- | --- |
+| 行情来源、日期、缺失值和数据质量 | `skills/a-share-market-data/SKILL.md` |
+| 趋势、均线、波动率、回撤和技术指标 | `skills/a-share-technical-analysis/SKILL.md` |
+| 年报、季报和经营质量 | `skills/a-share-earnings-analysis/SKILL.md` |
+| 同行业估值和质量比较 | `skills/a-share-comparables/SKILL.md` |
+| 行业指数和行业轮动 | `skills/a-share-sector-overview/SKILL.md` |
+| 投资逻辑、验证条件和失效条件 | `skills/a-share-thesis-tracker/SKILL.md` |
+| 财报、分红、解禁和公告事件 | `skills/a-share-catalyst-calendar/SKILL.md` |
+
+如果用户只要求查询最新价格，可以直接调用行情工具，不必加载全部 Skill。
 
 ## 数据顺序
 
@@ -25,3 +39,10 @@ summary: A 股研究、复盘和风险优先的策略分析规范
 - 不把模型置信度描述为上涨概率。
 - 组合违反硬约束时输出 `NO_TRADE` 或降低仓位。
 - 预测优先输出趋势、波动和情景范围，不输出未经验证的精确目标价。
+
+## 面向个人投资者的默认顺序
+
+1. 先确认用户的资金规模、投资期限、风险承受能力和应急现金要求；未知时不要假设用户可以承受全部本金损失。
+2. 先判断是否需要交易。数据不足、交易成本过高、无法买入一手或违反风险上限时，允许并优先输出 `NO_TRADE`。
+3. 小资金优先比较宽基 ETF 与个股，不为了表面分散而产生无法执行的极小仓位。
+4. 结论使用“支持证据、反向证据、数据缺口、下一步观察项”组织；不要把排序分数写成上涨概率。

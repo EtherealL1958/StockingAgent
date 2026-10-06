@@ -27,24 +27,30 @@ async function createResearchAgent(provider: MarketDataProvider): Promise<{ read
     ...(process.env.STOCKING_SESSION_FILE ? { filePath: process.env.STOCKING_SESSION_FILE } : {}),
     staticContext,
   });
-  const maxContextCharacters = readPositiveInteger(process.env.STOCKING_CONTEXT_MAX_CHARS) ?? 120_000;
-  const contextManager = new SlidingWindowContextManager({ maxCharacters: maxContextCharacters, keepRecentMessages: 40 });
   const apiKey = process.env.LLM_KEY;
   if (apiKey) {
     console.log(`使用真实 LLM：${process.env.LLM_MODEL ?? "deepseek-chat"}`);
-    return { session, agent: new ResearchAgent(
-      tools,
-      new ChatCompletionsResearchModel({
-        apiKey,
-        model: process.env.LLM_MODEL ?? "deepseek-chat",
-        baseUrl: process.env.LLM_API || "https://api.deepseek.com",
-        systemPrompt,
-      }, tools),
-      { session, contextManager },
-    ) };
+    const configuredContextWindow = readPositiveInteger(process.env.LLM_CONTEXT_WINDOW);
+    const model = new ChatCompletionsResearchModel({
+      apiKey,
+      model: process.env.LLM_MODEL ?? "deepseek-chat",
+      baseUrl: process.env.LLM_API || "https://api.deepseek.com",
+      systemPrompt,
+      ...(configuredContextWindow ? { contextWindow: configuredContextWindow } : {}),
+    }, tools);
+    return { session, agent: new ResearchAgent(tools, model, { session, contextManager: createContextManager(model.contextWindow) }) };
   }
   console.log("未配置 LLM_KEY，使用规则模型；自然语言分析能力受限");
-  return { session, agent: new ResearchAgent(tools, new RuleBasedResearchModel(), { session, contextManager }) };
+  const model = new RuleBasedResearchModel();
+  return { session, agent: new ResearchAgent(tools, model, { session, contextManager: createContextManager(model.contextWindow) }) };
+}
+
+function createContextManager(contextWindow: number): SlidingWindowContextManager {
+  return new SlidingWindowContextManager({
+    contextWindow,
+    reserveTokens: readPositiveInteger(process.env.LLM_RESERVE_TOKENS) ?? 4_096,
+    keepRecentTokens: readPositiveInteger(process.env.LLM_KEEP_RECENT_TOKENS) ?? 16_000,
+  });
 }
 
 export async function runTerminal(provider: MarketDataProvider = createMarketDataProvider()): Promise<void> {

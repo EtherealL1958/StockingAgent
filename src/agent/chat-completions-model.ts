@@ -147,12 +147,15 @@ export interface ChatCompletionsModelOptions {
   readonly baseUrl?: string;
   readonly systemPrompt: string;
   readonly timeoutMs?: number;
+  /** 当前模型的上下文窗口，单位为 token；由模型配置提供。 */
+  readonly contextWindow?: number;
   /** 仅用于注入测试或自定义运行时；生产环境默认使用全局 fetch。 */
   readonly fetchFn?: typeof fetch;
 }
 
 /** 使用 OpenAI-compatible Chat Completions 的真实工具调用 Model；不承担金融计算。 */
 export class ChatCompletionsResearchModel implements AgentModel {
+  public readonly contextWindow: number;
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly tools: readonly ChatToolDefinition[];
@@ -164,6 +167,8 @@ export class ChatCompletionsResearchModel implements AgentModel {
   ) {
     this.baseUrl = (modelOptions.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
     this.timeoutMs = modelOptions.timeoutMs ?? 60_000;
+    // 未提供模型窗口时不擅自假设一个上限；由调用方在模型配置中提供。
+    this.contextWindow = modelOptions.contextWindow ?? Number.POSITIVE_INFINITY;
     this.fetchFn = modelOptions.fetchFn ?? fetch;
     this.tools = buildChatCompletionsToolDefinitions().filter(definition => tools.some(tool => tool.name === definition.function.name));
   }

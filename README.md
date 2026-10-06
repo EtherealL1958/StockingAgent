@@ -6,7 +6,7 @@
 
 - `src/agent`：事件驱动 Agent runtime、可替换 model、JSONL 会话存储和上下文窗口管理；工具调用输入先做 Zod 校验。
 - `src/agent/resources.ts`：扫描 Skill 的 frontmatter，只把名称、用途和路径放入上下文；完整 Skill 由 Agent 通过 `read` 按需加载。
-- `skills/a-share-research/SKILL.md`：研究、复盘和风险优先的专业分析规范。
+- `skills/`：面向个人投资者的渐进式专业 Skill。`a-share-research` 负责总路由；`a-share-market-data`、`a-share-technical-analysis`、`a-share-earnings-analysis`、`a-share-comparables`、`a-share-sector-overview`、`a-share-thesis-tracker` 和 `a-share-catalyst-calendar` 分别负责数据质量、行情指标、财报、同行比较、行业、投资逻辑和事件日历。
 - `src/cli.ts`：终端交互入口，支持行情、历史、指标分析和研究摘要。
 - `src/tools`：通用工具（`read`、`write`、`web_search`、`code_exec`）和四个金融工具（`get_quote`、`get_market_history`、`get_fundamentals`、`screen_stocks`）。
 - `src/providers`：`MarketDataProvider` 统一数据边界。
@@ -83,9 +83,11 @@ BRAVE_SEARCH_API=https://api.search.brave.com/res/v1/web/search
 
 终端会自动恢复当前项目最近的 JSONL 会话。默认保存到 `.stocking/sessions/`，也可以通过 `STOCKING_SESSION_DIR` 指定目录，或通过 `STOCKING_SESSION_FILE` 指定一个会话文件。每次交互会追加用户消息、模型回复、工具调用和工具结果；重新启动后，下一次模型请求会收到此前的历史。
 
-会话文件把静态前缀和动态历史分开记录：静态前缀包含系统提示词和工具定义，动态历史按消息顺序追加。原始历史不会因为上下文裁剪而删除；默认模型上下文预算约为 120000 个字符，超过后只在发送给模型的投影中保留最近消息，并写入明确的“历史已省略”标记。可通过 `STOCKING_CONTEXT_MAX_CHARS` 调整预算。当前实现采用线性 JSONL；后续可在同一格式上增加 Pi 风格的 `/new`、分支和 LLM 摘要压缩。
+会话文件把静态前缀和动态历史分开记录：静态前缀包含系统提示词和工具定义，动态历史按消息顺序追加。原始历史不会因为上下文裁剪而删除；发送给模型的历史预算按 `contextWindow - reserveTokens` 计算，并优先保留 `keepRecentTokens` 个最近 token。`contextWindow` 由模型配置提供，终端可用 `LLM_CONTEXT_WINDOW`、`LLM_RESERVE_TOKENS` 和 `LLM_KEEP_RECENT_TOKENS` 配置；不再使用固定的字符上限。当前实现采用轻量 token 估算，后续可在同一接口接入供应商 tokenizer。
 
 LLM 启动时只看到 Skill 的名称、用途和文件路径。模型需要完整研究规范时，会先调用 `read` 读取 `skills/a-share-research/SKILL.md`，这与 pi agent 的渐进式 Skill 加载方式一致。工具结果由代码计算，模型只负责编排和解释。未配置 `LLM_KEY` 时，终端会明确使用规则模型，不能完成开放式自然语言研究。
+
+总 Skill 会根据任务提示具体的专业 Skill 路径。例如，分析历史走势时读取 `a-share-technical-analysis`，查询年报时读取 `a-share-earnings-analysis`，比较行业候选时读取 `a-share-comparables` 和 `a-share-sector-overview`。这些文件只规定分析流程、证据和边界，不把计算逻辑移入提示词；实际指标、费用、仓位和风险约束仍由 TypeScript domain 与金融工具执行。
 
 ## Agent 工具
 
