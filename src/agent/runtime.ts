@@ -1,4 +1,5 @@
 import { ZodError } from "zod";
+import { randomUUID } from "node:crypto";
 import type { AgentTool } from "../tools/tool.js";
 import type { ContextManager } from "./context.js";
 import type { AgentSession } from "./session.js";
@@ -6,6 +7,7 @@ import type { AgentSession } from "./session.js";
 export type AgentMessage = {
   readonly role: "system" | "user" | "assistant" | "tool";
   readonly content: string;
+  readonly toolCalls?: readonly AgentToolCall[];
   readonly toolName?: string;
   readonly toolInput?: unknown;
   readonly toolCallId?: string;
@@ -16,13 +18,24 @@ export type AgentMessage = {
   };
 };
 
+export interface AgentToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly input: unknown;
+}
+
+export interface ModelToolCall {
+  readonly id?: string;
+  readonly name: string;
+  readonly input: unknown;
+}
+
 export interface ModelResponse {
   readonly content?: string;
-  readonly toolCall?: {
-    readonly id?: string;
-    readonly name: string;
-    readonly input: unknown;
-  };
+  /** Legacy singular form remains accepted by custom models. */
+  readonly toolCall?: ModelToolCall;
+  /** Models may request independent tools in one response. */
+  readonly toolCalls?: readonly ModelToolCall[];
   readonly done: boolean;
 }
 
@@ -42,6 +55,8 @@ export interface AgentResponseCallbacks {
 
 export interface ResearchAgentOptions {
   readonly maxTurns?: number;
+  /** Handle explicit user replies outside model-controlled tool arguments. */
+  readonly handleUserReply?: (input: string) => Promise<string | undefined>;
   readonly session?: AgentSession;
   readonly contextManager?: ContextManager;
   /** 每次模型回合前重新读取的持久化用户/组合上下文。 */
@@ -74,6 +89,7 @@ export class ResearchAgent {
   ) {
     this.tools = new Map(tools.map(tool => [tool.name, tool]));
     this.maxTurns = options.maxTurns ?? 12;
+    this.handleUserReply = options.handleUserReply;
     this.session = options.session;
     this.contextManager = options.contextManager;
     this.dynamicContextProvider = options.dynamicContextProvider;
@@ -81,6 +97,7 @@ export class ResearchAgent {
   }
 
   private readonly maxTurns: number;
+  private readonly handleUserReply: ResearchAgentOptions["handleUserReply"];
   private readonly session: AgentSession | undefined;
   private readonly contextManager: ContextManager | undefined;
   private readonly dynamicContextProvider: ResearchAgentOptions["dynamicContextProvider"];
@@ -104,22 +121,32 @@ export class ResearchAgent {
     const userMessage: AgentMessage = { role: "user", content: userInput };
     await this.appendMessage(userMessage);
     this.emit({ type: "agent_start" });
+    const directReply = await this.handleUserReply?.(userInput);
+    if (directReply) {
+      await this.appendMessage({ role: "assistant", content: directReply });
+      this.emit({ type: "text_delta", delta: directReply });
+      this.emit({ type: "agent_end" });
+      return { answer: directReply, messages: this.history };
+    }
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       this.emit({ type: "turn_start" });
       const historyContext = this.contextManager?.buildAsync
-        ? await this.contextManager.buildAsync(this.history, this.model.summarizeContext)
+        ? await this.contextManager.buildAsync(this.history, this.model.summarizeContext?.bind(this.model))
         : this.contextManager?.build(this.history) ?? this.history;
       const dynamicContext = await this.dynamicContextProvider?.();
       const context = dynamicContext
-        ? [{ role: "system" as const, content: dynamicContext }, ...historyContext]
+        // Dynamic state is a status-bar message at the end of the trajectory.
+        // Keeping it out of the static prefix preserves prompt-cache reuse.
+        ? [...historyContext, { role: "system" as const, content: dynamicContext }]
         : historyContext;
       const response = await this.model.respond(context, {
         onThinkingDelta: delta => this.emit({ type: "thinking_delta", delta }),
         onTextDelta: delta => this.emit({ type: "text_delta", delta }),
       });
 
-      if (response.done || !response.toolCall) {
+      const requestedToolCalls = response.toolCalls ?? (response.toolCall ? [response.toolCall] : []);
+      if (response.done || requestedToolCalls.length === 0) {
         if (response.content) {
           await this.appendMessage({ role: "assistant", content: response.content });
         }
@@ -127,53 +154,62 @@ export class ResearchAgent {
         return { answer: response.content ?? "未生成结论", messages: this.history };
       }
 
+      const toolCalls: readonly AgentToolCall[] = requestedToolCalls.map(call => ({
+        id: call.id ?? randomUUID(),
+        name: call.name,
+        input: call.input,
+      }));
       await this.appendMessage({
         role: "assistant",
         content: response.content ?? "",
-        toolName: response.toolCall.name,
-        toolInput: response.toolCall.input,
-        ...(response.toolCall.id ? { toolCallId: response.toolCall.id } : {}),
+        toolCalls,
+        ...(toolCalls.length === 1 ? {
+          toolName: toolCalls[0]!.name,
+          toolInput: toolCalls[0]!.input,
+          toolCallId: toolCalls[0]!.id,
+        } : {}),
       });
-      const tool = this.tools.get(response.toolCall.name);
-      if (!tool) {
-        throw new Error(`unknown tool: ${response.toolCall.name}`);
-      }
+      const directResponses: string[] = [];
+      for (const toolCall of toolCalls) {
+        const tool = this.tools.get(toolCall.name);
+        if (!tool) {
+          const result = toolError("unknown_tool", new Error(`未知工具: ${toolCall.name}`));
+          this.emit({ type: "tool_end", toolName: toolCall.name, result });
+          await this.appendToolResult(toolCall, result);
+          continue;
+        }
 
-      let input: unknown;
-      try {
-        input = tool.input.parse(response.toolCall.input);
-      } catch (error) {
-        const result = toolError("invalid_tool_input", error);
+        let input: unknown;
+        try {
+          input = tool.input.parse(toolCall.input);
+        } catch (error) {
+          const result = toolError("invalid_tool_input", error);
+          this.emit({ type: "tool_end", toolName: tool.name, result });
+          await this.appendToolResult({ ...toolCall, input: toolCall.input }, result);
+          continue;
+        }
+        this.emit({ type: "tool_start", toolName: tool.name, input });
+        let result: unknown;
+        try {
+          result = await tool.execute(input, {
+            userMessages: this.history.filter(message => message.role === "user").map(message => message.content),
+          });
+        } catch (error) {
+          // Provider 错误是证据缺失，不是金融结论；将其交回模型让它明确报告不完整性。
+          result = toolError("tool_execution_error", error);
+        }
         this.emit({ type: "tool_end", toolName: tool.name, result });
-        await this.appendMessage({
-          role: "tool",
-          content: JSON.stringify(result),
-          toolName: tool.name,
-          toolInput: response.toolCall.input,
-          ...(response.toolCall.id ? { toolCallId: response.toolCall.id } : {}),
-        });
-        continue;
+        await this.appendToolResult({ ...toolCall, input }, result);
+        const userResponse = tool.userResponse?.(result);
+        if (userResponse) directResponses.push(userResponse);
       }
-      this.emit({ type: "tool_start", toolName: tool.name, input });
-      let result: unknown;
-      try {
-        result = await tool.execute(input);
-      } catch (error) {
-        // Provider 错误是证据缺失，不是金融结论；将其交回模型让它明确报告不完整性。
-        result = toolError("tool_execution_error", error);
+      if (directResponses.length > 0) {
+        const directResponse = directResponses.join("\n");
+        await this.appendMessage({ role: "assistant", content: directResponse });
+        this.emit({ type: "text_delta", delta: directResponse });
+        this.emit({ type: "agent_end" });
+        return { answer: directResponse, messages: this.history };
       }
-      this.emit({ type: "tool_end", toolName: tool.name, result });
-      const toolMessage: AgentMessage = {
-        role: "tool",
-        content: JSON.stringify(result),
-        toolName: tool.name,
-        toolInput: input,
-        ...(response.toolCall.id ? { toolCallId: response.toolCall.id } : {}),
-      };
-      const preparedToolMessage = this.contextManager?.prepareMessage
-        ? await this.contextManager.prepareMessage(toolMessage)
-        : toolMessage;
-      await this.appendMessage(preparedToolMessage);
     }
 
     throw new Error(`研究步骤超过上限（${this.maxTurns} 个模型回合）`);
@@ -182,6 +218,20 @@ export class ResearchAgent {
   private async appendMessage(message: AgentMessage): Promise<void> {
     if (this.session) await this.session.append(message);
     this.history.push(message);
+  }
+
+  private async appendToolResult(toolCall: AgentToolCall, result: unknown): Promise<void> {
+    const toolMessage: AgentMessage = {
+      role: "tool",
+      content: JSON.stringify(result),
+      toolName: toolCall.name,
+      toolInput: toolCall.input,
+      toolCallId: toolCall.id,
+    };
+    const preparedToolMessage = this.contextManager?.prepareMessage
+      ? await this.contextManager.prepareMessage(toolMessage)
+      : toolMessage;
+    await this.appendMessage(preparedToolMessage);
   }
 }
 

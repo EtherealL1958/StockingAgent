@@ -1,50 +1,68 @@
 import { z } from "zod";
-import { JsonUserProfileStore } from "../memory/user-profile.js";
+import { JsonUserProfileStore, profileEvidenceSchema, profilePatchSchema } from "../memory/user-profile.js";
 import { defineTool } from "./tool.js";
 
-const nullableNonNegative = z.number().nonnegative().nullable().optional();
+const EMPTY_PARAMETERS = { type: "object", properties: {}, additionalProperties: false } as const;
+const PROFILE_UPDATE_PARAMETERS = {
+  type: "object",
+  properties: {
+    changes: {
+      type: "object",
+      minProperties: 1,
+      additionalProperties: false,
+      properties: {
+        investableCash: { type: ["number", "null"], minimum: 0, description: "可投资资金，例如 10000 元" },
+        monthlyContribution: { type: ["number", "null"], minimum: 0, description: "每月可投入金额，例如 500 元" },
+        horizonYears: { type: ["number", "null"], exclusiveMinimum: 0, description: "投资期限，例如 3 年" },
+        riskLevel: { type: ["string", "null"], enum: ["low", "medium", "high", null], description: "风险承受能力" },
+        maxDrawdown: { type: ["number", "null"], minimum: 0, maximum: 1, description: "最大可接受回撤，例如 0.1 表示 10%" },
+        emergencyCashRequired: { type: ["number", "null"], minimum: 0, description: "需要保留的应急现金，例如 20000 元" },
+        investmentGoal: { type: ["string", "null"], enum: ["capital_preservation", "steady_growth", "long_term_growth", null], description: "投资目标" },
+        experienceLevel: { type: ["string", "null"], enum: ["beginner", "intermediate", "advanced", null], description: "投资经验" },
+        preferredAssets: { type: ["array", "null"], items: { type: "string", enum: ["broad_etf", "industry_etf", "stock", "bond", "cash"] }, description: "偏好资产类型" },
+        avoidedSectors: { type: ["array", "null"], items: { type: "string" }, description: "希望回避的行业" },
+        notes: { type: ["array", "null"], items: { type: "string" }, description: "长期约束或备注" },
+      },
+    },
+    evidence: {
+      type: "object",
+      description: "逐字段用户原话，例如 {monthlyContribution:'每月200元'}；不能引用模型或工具内容",
+      additionalProperties: { type: "string", minLength: 1, maxLength: 2000 },
+    },
+  },
+  required: ["changes", "evidence"],
+  additionalProperties: false,
+} as const;
 
 export function buildUserMemoryTools(store: JsonUserProfileStore) {
   return [
     defineTool({
       name: "get_user_profile",
-      description: "当需要制定个性化投资计划、组合配置、再平衡或解释风险时使用；也可在主动询问用户前使用。返回持久化且已确认的字段和缺失字段。不要把对话中的猜测写入画像，不返回行情或持仓数据。",
-      input: z.object({}),
+      description: "制定个性化投资计划前读取用户画像。只返回有逐字段用户确认记录的事实；missingFields 是待询问项，unverifiedFields 是旧记录中无证据的字段。不是持仓、行情或推测。",
+      input: z.object({}).strict(),
+      modelParameters: EMPTY_PARAMETERS,
       execute: async () => ({
         available: true,
         profile: store.snapshot,
         missingFields: store.missingFields,
-        planningProfile: store.toInvestorProfile(),
-        nextQuestions: store.missingFields.length > 0
-          ? `请依次询问：${store.missingFields.join("、")}。用户确认后再调用 update_user_profile。`
-          : "用户画像字段已齐全，可结合当前组合和行情制定计划。",
+        unverifiedFields: store.unverifiedFields,
+        planningProfile: store.toInvestorProfile() ?? null,
+        pendingConfirmation: store.pendingPrompt ?? null,
       }),
     }),
     defineTool({
       name: "update_user_profile",
-      description: "当用户明确提供或确认资金、投入计划、期限、风险承受能力或投资偏好时使用。必须把 confirmed=true；false 只返回需要确认，不会写入。字段传 null 表示用户明确要求清除该字段。工具只更新用户画像，不执行交易，不修改组合持仓。",
-      input: z.object({
-        confirmed: z.boolean().describe("用户是否明确说出或确认这些信息；只有 true 才会持久化"),
-        investableCash: nullableNonNegative.describe("可投资资金，人民币，例如 10000；不是全部生活费"),
-        monthlyContribution: nullableNonNegative.describe("每月可继续投入金额，例如 500"),
-        horizonYears: z.number().positive().nullable().optional().describe("计划投资期限，例如 3 或 5"),
-        riskLevel: z.enum(["low", "medium", "high"]).nullable().optional().describe("风险承受能力，例如 low"),
-        maxDrawdown: z.number().min(0).max(1).nullable().optional().describe("最大可接受回撤比例，例如 0.1 表示 10%"),
-        emergencyCashRequired: nullableNonNegative.describe("需要保留的应急现金，人民币，例如 20000"),
-        investmentGoal: z.enum(["capital_preservation", "steady_growth", "long_term_growth"]).nullable().optional().describe("目标：保本优先、稳健增长或长期增长"),
-        experienceLevel: z.enum(["beginner", "intermediate", "advanced"]).nullable().optional().describe("投资经验，例如 beginner"),
-        preferredAssets: z.array(z.enum(["broad_etf", "industry_etf", "stock", "bond", "cash"])).max(10).nullable().optional().describe("用户明确偏好的资产类型，例如 [broad_etf, cash]"),
-        avoidedSectors: z.array(z.string().min(1).max(80)).max(30).nullable().optional().describe("用户明确希望回避的行业，例如 [房地产]"),
-        notes: z.array(z.string().min(1).max(500)).max(30).nullable().optional().describe("用户明确表达的长期投资约束或偏好"),
-      }).refine(value => Object.keys(value).some(key => key !== "confirmed" && value[key as keyof typeof value] !== undefined), "至少提供一个画像字段"),
-      execute: async input => {
-        if (!input.confirmed) {
-          return { available: false, updated: false, requiresConfirmation: true, message: "用户画像未更新；请先向用户复述这些字段并请求确认。" };
-        }
-        const { confirmed: _confirmed, ...patch } = input;
-        const profile = await store.update(patch);
-        return { available: true, updated: true, profile, missingFields: store.missingFields, planningProfile: store.toInvestorProfile() };
-      },
+      description: "用户提供画像信息时提出待确认变更，例如 changes={monthlyContribution:200}, evidence={monthlyContribution:'每月200元'}。每个字段必须引用用户原话；不接受 confirmed 或模型自证。闲钱不等于应急金为0，推荐ETF不等于用户偏好。null 表示候选清除；数组整体替换。仅创建候选，系统展示明细并等待用户选择确认后才用于规划。",
+      input: z.object({ changes: profilePatchSchema, evidence: profileEvidenceSchema }).strict(),
+      modelParameters: PROFILE_UPDATE_PARAMETERS,
+      execute: async ({ changes, evidence }, context) => ({
+        available: true,
+        updated: false,
+        requiresConfirmation: true,
+        message: await store.propose(changes, evidence, context?.userMessages ?? []),
+      }),
+      // Stop this model turn so the exact proposed values, rather than a paraphrase, are shown.
+      userResponse: result => result.message,
     }),
-  ];
+  ] as const;
 }

@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { createWebSearchProvider, type WebSearchInput, type WebSearchProvider } from "../providers/web-search.js";
 import { defineTool } from "./tool.js";
@@ -9,12 +9,61 @@ const MAX_READ_LINES = 400;
 const MAX_OUTPUT_BYTES = 32_000;
 const MAX_EXECUTION_MS = 30_000;
 
-function projectPath(cwd: string, requestedPath: string): string {
+const READ_PARAMETERS = {
+  type: "object",
+  properties: {
+    path: { type: "string", description: "项目相对路径，例如 skills/a-share-research/SKILL.md 或 reports/2025-q4.txt；不要传绝对路径或 .env" },
+    offset: { type: "integer", minimum: 1, description: "1-based 起始行，例如 401" },
+    limit: { type: "integer", minimum: 1, maximum: MAX_READ_LINES, description: "读取行数，例如 20；默认 400，最大 400" },
+  },
+  required: ["path"],
+  additionalProperties: false,
+} as const;
+
+const WRITE_PARAMETERS = {
+  type: "object",
+  properties: {
+    path: { type: "string", description: "项目相对输出路径，例如 reports/600519-review.md" },
+    content: { type: "string", description: "原样写入的 Markdown，例如 '# 600519 复盘\n...'" },
+    overwrite: { type: "boolean", default: false, description: "是否覆盖已有文件；默认 false，已有文件会报错" },
+  },
+  required: ["path", "content"],
+  additionalProperties: false,
+} as const;
+
+const WEB_SEARCH_PARAMETERS = {
+  type: "object",
+  properties: {
+    query: { type: "string", minLength: 2, maxLength: 500, description: "原样搜索词，例如 贵州茅台 2025 年年报" },
+    count: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "结果条数，例如 5，最大 10" },
+    freshness: { type: "string", enum: ["pd", "pw", "pm", "py"], description: "pd=过去一天、pw=过去一周、pm=过去一月、py=过去一年；省略不限定" },
+    searchLang: { type: "string", enum: ["zh-hans", "en"], default: "zh-hans", description: "搜索语言，例如 zh-hans；实际请求会保留该输入" },
+  },
+  required: ["query"],
+  additionalProperties: false,
+} as const;
+
+const CODE_EXEC_PARAMETERS = {
+  type: "object",
+  properties: {
+    language: { type: "string", enum: ["javascript", "python"], description: "例如 javascript 或 python；不接受 shell/bash" },
+    code: { type: "string", minLength: 1, maxLength: 100_000, description: "原样执行的短代码，例如 console.log(2 + 3)" },
+    timeoutMs: { type: "integer", minimum: 1, maximum: MAX_EXECUTION_MS, default: 10_000, description: "超时毫秒数，默认 10000，最大 30000" },
+  },
+  required: ["language", "code"],
+  additionalProperties: false,
+} as const;
+
+async function resolveProjectPath(cwd: string, requestedPath: string): Promise<string> {
   if (requestedPath.includes("\0")) throw new Error("路径包含非法字符");
   if (isAbsolute(requestedPath)) throw new Error("只接受项目相对路径");
   const absolute = resolve(cwd, requestedPath);
-  const outsideProject = relative(cwd, absolute).startsWith("..");
-  if (outsideProject || isAbsolute(relative(cwd, absolute)) || absolute.endsWith("/.env") || absolute.includes("/.env.")) {
+  const projectRoot = await fs.realpath(cwd);
+  const resolvedTarget = await realpathWithMissingAncestors(absolute);
+  const relativeTarget = relative(projectRoot, resolvedTarget);
+  const outsideProject = relativeTarget === ".." || relativeTarget.startsWith("../") || isAbsolute(relativeTarget);
+  const isSecretPath = (path: string): boolean => path.split("/").some(segment => segment === ".env" || segment.startsWith(".env."));
+  if (outsideProject || isSecretPath(absolute) || isSecretPath(resolvedTarget)) {
     throw new Error("只能访问项目目录内的非秘密文件");
   }
   return absolute;
@@ -35,9 +84,10 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
         path: z.string().min(1).describe("项目相对路径，例如 skills/a-share-research/SKILL.md 或 reports/2025-q4.txt；不要传 .env 或绝对路径"),
         offset: z.number().int().positive().optional().describe("1-based 起始行，例如上一页返回 endLine=400 时传 401"),
         limit: z.number().int().positive().max(MAX_READ_LINES).optional().describe("读取行数，默认 400，最大 400；例如只看文件开头可传 20"),
-      }),
+      }).strict(),
+      modelParameters: READ_PARAMETERS,
       execute: async ({ path, offset, limit }) => {
-        const absolutePath = projectPath(cwd, path);
+        const absolutePath = await resolveProjectPath(cwd, path);
         if ([".pdf", ".png", ".jpg", ".jpeg", ".gif"].includes(extname(absolutePath).toLowerCase())) {
           throw new Error("read 只支持 UTF-8 文本文件；PDF 和图片请先转换为文本");
         }
@@ -54,26 +104,15 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
     }),
     defineTool({
       name: "write",
-      description: "当用户要求保存研究总结、复盘记录或策略草稿时使用，例如写入 reports/600519-review.md。path 必须是项目相对路径；工具会按 UTF-8 原样写入并自动创建父目录，不接受绝对路径、项目外路径或 .env 文件，也不会发布到外部服务。成功返回示例字段为 {path:'reports/600519-review.md', bytes:1234, written:true}。",
+      description: "当用户明确要求保存研究总结、复盘记录、策略草稿或独立执行清单时使用，例如写入 reports/600519-review.md。一个研究任务默认只有一个主报告；后续补充内容应更新已有报告，只有用户明确要求另存为、单独清单或交付物确实独立时才创建新文件。无法判断时先询问用户，不要直接写两个重叠文件。path 必须是项目相对路径；工具会按 UTF-8 原样写入并自动创建父目录，不接受绝对路径、项目外路径或 .env 文件，也不会发布到外部服务。成功返回示例字段为 {path:'reports/600519-review.md', bytes:1234, written:true}。",
       input: z.object({
         path: z.string().min(1).describe("项目相对输出路径，例如 reports/600519-review.md"),
         content: z.string().describe("要原样保存的 Markdown 或纯文本内容；例如 '# 600519 复盘\\n...'"),
         overwrite: z.boolean().default(false).describe("是否覆盖已有文件；默认 false，已有文件时工具会报错"),
-      }),
+      }).strict(),
+      modelParameters: WRITE_PARAMETERS,
       execute: async ({ path, content, overwrite }) => {
-        const absolutePath = projectPath(cwd, path);
-        if (!overwrite) {
-          try {
-            await fs.access(absolutePath);
-            throw new Error(`文件已存在：${path}；如需覆盖请设置 overwrite=true`);
-          } catch (error) {
-            if (error instanceof Error && !error.message.startsWith("文件已存在")) {
-              // 文件不存在时继续写入。
-            } else {
-              throw error;
-            }
-          }
-        }
+        const absolutePath = await resolveProjectPath(cwd, path);
         const parent = dirname(absolutePath);
         let parentExisted = true;
         try {
@@ -82,7 +121,14 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
           parentExisted = false;
         }
         await fs.mkdir(parent, { recursive: true });
-        await fs.writeFile(absolutePath, content, "utf8");
+        try {
+          await fs.writeFile(absolutePath, content, { encoding: "utf8", flag: overwrite ? "w" : "wx" });
+        } catch (error) {
+          if (!overwrite && isFileExists(error)) {
+            throw new Error(`文件已存在：${path}；如需覆盖请设置 overwrite=true`);
+          }
+          throw error;
+        }
         return { path: relative(cwd, absolutePath), encoding: "utf-8", bytes: Buffer.byteLength(content, "utf8"), overwrite, parentCreated: !parentExisted, written: true };
       },
     }),
@@ -94,7 +140,8 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
         count: z.number().int().positive().max(10).default(5).describe("返回条数，例如 5；最大 10"),
         freshness: z.enum(["pd", "pw", "pm", "py"]).optional().describe("时间过滤：pd=过去一天、pw=过去一周、pm=过去一月、py=过去一年；省略表示不限定"),
         searchLang: z.enum(["zh-hans", "en"]).default("zh-hans").describe("搜索语言，例如 zh-hans；会原样写入请求元数据"),
-      }),
+      }).strict(),
+      modelParameters: WEB_SEARCH_PARAMETERS,
       execute: async ({ query, count, freshness, searchLang }) => {
         const request: WebSearchInput = {
           query,
@@ -112,10 +159,36 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
         language: z.enum(["javascript", "python"]).describe("执行语言，例如 javascript 或 python；不接受 shell/bash"),
         code: z.string().min(1).max(100_000).describe("要原样执行的短代码，例如 console.log(2 + 3)"),
         timeoutMs: z.number().int().positive().max(MAX_EXECUTION_MS).default(10_000).describe("超时毫秒数，默认 10000，最大 30000"),
-      }),
+      }).strict(),
+      modelParameters: CODE_EXEC_PARAMETERS,
       execute: async ({ language, code, timeoutMs }) => executeCode(cwd, language, code, timeoutMs ?? 10_000),
     }),
-  ];
+  ] as const;
+}
+
+async function realpathWithMissingAncestors(path: string): Promise<string> {
+  const suffix: string[] = [];
+  let current = path;
+  while (true) {
+    try {
+      const resolved = await fs.realpath(current);
+      return suffix.reduce((parent, segment) => join(parent, segment), resolved);
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+function isMissingFile(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isFileExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 async function executeCode(cwd: string, language: "javascript" | "python", code: string, timeoutMs: number) {

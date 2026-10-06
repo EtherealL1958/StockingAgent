@@ -1,4 +1,4 @@
-import type { InvestorProfile } from "./types.js";
+import type { InvestorProfile, RiskLevel } from "./types.js";
 
 export type OrderSide = "buy" | "sell";
 
@@ -84,11 +84,22 @@ export interface PortfolioRiskViolation {
   readonly message: string;
 }
 
+const DEFAULT_RESERVE_RATIOS: Record<RiskLevel, number> = {
+  low: 0.30,
+  medium: 0.20,
+  high: 0.10,
+};
+const MAX_SINGLE_STOCK_WEIGHTS: Record<RiskLevel, number> = {
+  low: 0.15,
+  medium: 0.20,
+  high: 0.25,
+};
+
 export function defaultRiskLimits(profile: InvestorProfile): PortfolioRiskLimits {
   return {
-    maxSingleStockWeight: profile.riskLevel === "low" ? 0.15 : profile.riskLevel === "medium" ? 0.20 : 0.25,
+    maxSingleStockWeight: MAX_SINGLE_STOCK_WEIGHTS[profile.riskLevel],
     maxIndustryWeight: 0.30,
-    minimumCashReserve: profile.cashReserveRatio ?? (profile.riskLevel === "low" ? 0.30 : profile.riskLevel === "medium" ? 0.20 : 0.10),
+    minimumCashReserve: profile.cashReserveRatio ?? DEFAULT_RESERVE_RATIOS[profile.riskLevel],
   };
 }
 

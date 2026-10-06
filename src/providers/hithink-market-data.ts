@@ -182,7 +182,7 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     from?: string,
     to?: string,
   ): Promise<readonly DailyBar[]> {
-    const end = to ? this.parseDate(to) : new Date();
+    const end = to ? this.parseDate(to, true) : new Date();
     const start = from
       ? this.parseDate(from)
       : new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
@@ -192,8 +192,8 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
       {
         thscode: this.toThscode(ticker),
         interval: "1d",
-      start: String(start.getTime()),
-      end: String(end.getTime()),
+        start: String(start.getTime()),
+        end: String(end.getTime()),
         adjust: "forward",
       },
     );
@@ -214,7 +214,7 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     from?: string,
     to?: string,
   ): Promise<readonly DailyBar[]> {
-    const end = to ? this.parseDate(to) : new Date();
+    const end = to ? this.parseDate(to, true) : new Date();
     const start = from
       ? this.parseDate(from)
       : new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
@@ -245,7 +245,9 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     const values = new Map<string, number>();
     for (const ability of data.abilities) {
       for (const indicator of ability.indicators) {
-        const value = indicator.value === null ? undefined : Number(indicator.value);
+        const value = indicator.value === null || indicator.value.trim() === ""
+          ? undefined
+          : Number(indicator.value);
         if (value !== undefined && Number.isFinite(value)) {
           values.set(indicator.index_id, value);
         }
@@ -361,10 +363,13 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
     throw new Error(`暂不支持自动推断交易所的证券代码: ${ticker}`);
   }
 
-  private parseDate(value: string): Date {
+  private parseDate(value: string, endOfDay = false): Date {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) {
       throw new Error(`日期格式无效: ${value}`);
+    }
+    if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      date.setUTCHours(23, 59, 59, 999);
     }
     return date;
   }
@@ -390,10 +395,8 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
 
   private toSecurity(item: z.infer<typeof tickerDataSchema>["item"][number]): Security {
     const isEtf = item.asset_type === "fund-etf";
-    if (!isEtf && item.exchange !== "SH" && item.exchange !== "SZ" && item.exchange !== "BJ") {
-      throw new Error(`无法识别证券交易所: ${item.thscode}`);
-    }
-    const board = isEtf ? "etf" : this.inferBoard(item.ticker, item.exchange);
+    const exchange = isEtf ? item.exchange : this.inferExchange(item.exchange, item.thscode);
+    const board = isEtf ? "etf" : this.inferBoard(item.ticker, exchange);
     return {
       ticker: item.ticker,
       name: item.name,
@@ -403,6 +406,14 @@ export class HiThinkMarketDataProvider implements MarketDataProvider {
       lotSize: board === "star" || board === "chinext" ? 200 : 100,
       isIndex: false,
     };
+  }
+
+  private inferExchange(exchange: string | null, thscode: string): "SH" | "SZ" | "BJ" {
+    const normalizedExchange = exchange?.toUpperCase();
+    if (normalizedExchange === "SH" || normalizedExchange === "SZ" || normalizedExchange === "BJ") return normalizedExchange;
+    const suffix = thscode.match(/\.(SH|SZ|BJ)$/i)?.[1]?.toUpperCase();
+    if (suffix === "SH" || suffix === "SZ" || suffix === "BJ") return suffix;
+    throw new Error(`无法识别证券交易所: ${thscode}`);
   }
 
   private inferBoard(ticker: string, exchange: string | null): "sh_main" | "sz_main" | "bj_main" | "chinext" | "star" {

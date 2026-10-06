@@ -109,6 +109,50 @@ test("agent leaves a final synthesis turn after repeated tool calls", async () =
   assert.match(result.answer, /生成总结/);
 });
 
+test("agent preserves and executes multiple model tool calls", async () => {
+  const calls: string[] = [];
+  const firstTool = defineTool({
+    name: "first",
+    description: "测试第一个工具",
+    input: z.object({ value: z.number() }),
+    execute: async ({ value }) => {
+      calls.push("first");
+      return { value };
+    },
+  });
+  const secondTool = defineTool({
+    name: "second",
+    description: "测试第二个工具",
+    input: z.object({ value: z.number() }),
+    execute: async ({ value }) => {
+      calls.push("second");
+      return { value: value * 2 };
+    },
+  });
+  let sawBothResults = false;
+  const agent = new ResearchAgent([firstTool, secondTool], {
+    respond: async messages => {
+      const assistant = messages.find(message => message.role === "assistant" && message.toolCalls);
+      if (assistant?.toolCalls?.length === 2) {
+        sawBothResults = messages.filter(message => message.role === "tool").length === 2;
+        return { done: true, content: "两个工具均已执行" };
+      }
+      return {
+        done: false,
+        toolCalls: [
+          { id: "call-first", name: "first", input: { value: 2 } },
+          { id: "call-second", name: "second", input: { value: 3 } },
+        ],
+      };
+    },
+  });
+
+  const result = await agent.run("同时执行两个计算");
+  assert.match(result.answer, /两个工具/);
+  assert.deepEqual(calls, ["first", "second"]);
+  assert.equal(sawBothResults, true);
+});
+
 test("invalid tool input is returned as concise actionable validation feedback", async () => {
   let validationMessage = "";
   const tool = defineTool({
@@ -196,7 +240,7 @@ test("user profile memory requires confirmation, persists, and is injected into 
     const beforeConfirmation = store.snapshot;
     assert.equal(beforeConfirmation.investableCash, undefined);
 
-    const updated = await store.update({
+    const patch = {
       investableCash: 10_000,
       monthlyContribution: 500,
       horizonYears: 5,
@@ -204,8 +248,14 @@ test("user profile memory requires confirmation, persists, and is injected into 
       maxDrawdown: 0.1,
       emergencyCashRequired: 20_000,
       investmentGoal: "steady_growth",
-    });
-    assert.equal(updated.investableCash, 10_000);
+    };
+    const source = "可投资10000元，每月500元，5年，低风险，回撤10%，应急现金20000元，目标稳健增长。";
+    const evidence = Object.fromEntries(Object.keys(patch).map(key => [key, source]));
+    await store.propose(patch, evidence, [source]);
+    assert.equal(store.snapshot.investableCash, undefined);
+    const pending = JSON.parse(await readFile(store.filePath, "utf8")).pending;
+    await store.handleUserReply(`确认画像 ${pending.id} 全部`);
+    assert.equal(store.snapshot.investableCash, 10_000);
     assert.equal(store.toInvestorProfile()?.investableCash, 10_000);
 
     const reopened = await JsonUserProfileStore.open({ cwd: directory, filePath: join(directory, "profile.json"), userId: "user-1" });
@@ -218,9 +268,11 @@ test("user profile memory requires confirmation, persists, and is injected into 
       },
     }, { dynamicContextProvider: () => reopened.toPromptContext() });
     await agent.run("制定我的长期计划");
-    assert.equal(seenContext[0]?.role, "system");
-    assert.match(seenContext[0]?.content ?? "", /investableCash/);
-    assert.match(seenContext[0]?.content ?? "", /10000/);
+    const profileContext = seenContext.find(message => message.role === "system");
+    assert.equal(profileContext?.role, "system");
+    assert.equal(seenContext.at(-1)?.role, "system");
+    assert.match(profileContext?.content ?? "", /investableCash/);
+    assert.match(profileContext?.content ?? "", /10000/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -346,6 +398,31 @@ test("Chat Completions model reconstructs streamed tool call arguments", async (
 
   assert.equal(response.done, false);
   assert.deepEqual(response.toolCall, { id: "call-1", name: "get_quote", input: { ticker: "600519" } });
+});
+
+test("Chat Completions model preserves multiple tool calls", async () => {
+  const payload = {
+    choices: [{
+      message: {
+        content: null,
+        tool_calls: [
+          { id: "call-1", function: { name: "get_quote", arguments: '{"ticker":"600519"}' } },
+          { id: "call-2", function: { name: "get_quote", arguments: '{"ticker":"510300"}' } },
+        ],
+      },
+    }],
+  };
+  const model = new ChatCompletionsResearchModel({
+    apiKey: "test-key",
+    model: "test-model",
+    systemPrompt: "测试",
+    fetchFn: async () => new Response(JSON.stringify(payload), { status: 200 }),
+  }, []);
+  const response = await model.respond([{ role: "user", content: "同时查询两只证券" }]);
+
+  assert.equal(response.done, false);
+  assert.equal(response.toolCalls?.length, 2);
+  assert.deepEqual(response.toolCalls?.map(call => call.name), ["get_quote", "get_quote"]);
 });
 
 test("optimizer rejects an unaffordable stock", () => {
@@ -547,4 +624,110 @@ test("Tavily provider preserves the unified search contract and reports provider
   assert.equal(requestBody?.language, "zh-cn");
   assert.equal(requestBody?.api_key, undefined);
   assert.equal(result.results[0]?.publishedAt, "2026-10-01");
+});
+
+test("profile regression: model confirmation cannot turn idle cash or ETF suggestions into facts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-profile-quality-"));
+  try {
+    const store = await JsonUserProfileStore.open({ cwd: directory });
+    const [getProfile, updateProfile] = buildUserMemoryTools(store);
+    assert.throws(() => updateProfile.input.parse({ confirmed: true, emergencyCashRequired: 0 }));
+    const userText = "这笔5000元是闲钱，我打算放1年左右";
+    const candidate = updateProfile.input.parse({
+      changes: { investableCash: 5000, emergencyCashRequired: 0, preferredAssets: ["broad_etf", "cash"] },
+      evidence: { investableCash: userText, emergencyCashRequired: userText, preferredAssets: userText },
+    });
+    const result = await updateProfile.execute(candidate, { userMessages: [userText] });
+    assert.equal(result.updated, false);
+    assert.equal(store.snapshot.emergencyCashRequired, undefined);
+    assert.equal(store.snapshot.preferredAssets, undefined);
+    assert.equal((await getProfile.execute({})).planningProfile, null);
+    assert.match(result.message, /尚未用于规划/);
+    // Accept only the amount actually provided, never the inferred fields beside it.
+    const persisted = JSON.parse(await readFile(store.filePath, "utf8"));
+    const reopened = await JsonUserProfileStore.open({ cwd: directory });
+    await reopened.handleUserReply(`确认画像 ${persisted.pending.id} 1`);
+    assert.equal(reopened.snapshot.investableCash, 5000);
+    assert.equal(reopened.snapshot.emergencyCashRequired, undefined);
+    assert.equal(reopened.snapshot.preferredAssets, undefined);
+    const audited = JSON.parse(await readFile(store.filePath, "utf8"));
+    assert.equal(audited.confirmations.investableCash.quote, userText);
+    assert.equal(audited.pending, undefined);
+    assert.match(await reopened.handleUserReply(`确认画像 ${persisted.pending.id} 全部`) ?? "", /过期/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("profile rejects fabricated evidence and legacy fields remain outside planning context", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-profile-legacy-"));
+  try {
+    const { writeFile } = await import("node:fs/promises");
+    const filePath = join(directory, "profile.json");
+    await writeFile(filePath, JSON.stringify({
+      version: 1, userId: "default", updatedAt: new Date().toISOString(), investableCash: 5000,
+      emergencyCashRequired: 0, experienceLevel: "beginner", investmentGoal: "steady_growth", preferredAssets: ["broad_etf"],
+    }));
+    const store = await JsonUserProfileStore.open({ cwd: directory, filePath });
+    assert.equal(store.snapshot.emergencyCashRequired, undefined);
+    assert.ok(store.unverifiedFields.includes("preferredAssets"));
+    assert.equal(store.toInvestorProfile(), undefined);
+    const original = await readFile(filePath, "utf8");
+    await assert.rejects(store.propose({ preferredAssets: ["broad_etf"] }, { preferredAssets: "我喜欢ETF" }, ["这笔钱是闲钱"]), /实际用户消息/);
+    await assert.rejects(store.propose({ investableCash: 5000 }, {}, ["5000"]), /完全相同/);
+    assert.equal(await readFile(filePath, "utf8"), original);
+    // Old values remain on disk for audit, but are never labelled as confirmed.
+    assert.equal(JSON.parse(original).emergencyCashRequired, 0);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("runtime pauses on a profile proposal and only trusted user replies commit it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-profile-runtime-"));
+  try {
+    const store = await JsonUserProfileStore.open({ cwd: directory });
+    let calls = 0;
+    const source = "每月200元";
+    const agent = new ResearchAgent(buildUserMemoryTools(store), {
+      respond: async messages => {
+        calls += 1;
+        if (calls === 1) return { done: false, toolCall: { id: "profile-call", name: "update_user_profile", input: {
+          changes: { monthlyContribution: 200 }, evidence: { monthlyContribution: source },
+        } } };
+        assert.match(messages.find(message => message.role === "system")?.content ?? "", /"monthlyContribution":200/);
+        return { done: true, content: "按已确认的月投入规划" };
+      },
+    }, { handleUserReply: input => store.handleUserReply(input), dynamicContextProvider: () => store.toPromptContext() });
+    const result = await agent.run(source);
+    assert.equal(calls, 1);
+    assert.match(result.answer, /每月投入/);
+    assert.equal(store.snapshot.monthlyContribution, undefined);
+    assert.equal(result.messages.filter(m => m.role === "tool").length, 1);
+    const pending = JSON.parse(await readFile(store.filePath, "utf8")).pending;
+    await agent.run(`确认画像 ${pending.id} 全部`);
+    assert.equal(calls, 1); // The model is not asked whether the user's confirmation is valid.
+    assert.equal(store.snapshot.monthlyContribution, 200);
+    await agent.run("继续规划");
+    assert.equal(calls, 2);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("profile correction, clearing, invalid selections and cancellation preserve confirmed state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-profile-correction-"));
+  try {
+    const store = await JsonUserProfileStore.open({ cwd: directory });
+    const id = async () => JSON.parse(await readFile(store.filePath, "utf8")).pending.id;
+    await store.propose({ monthlyContribution: 200 }, { monthlyContribution: "每月200" }, ["每月200"]);
+    await store.handleUserReply(`确认画像 ${await id()} 全部`);
+    await store.propose({ monthlyContribution: 300 }, { monthlyContribution: "改成300" }, ["改成300"]);
+    assert.equal(store.snapshot.monthlyContribution, 200);
+    await store.handleUserReply(`确认画像 ${await id()} 99`);
+    assert.equal(store.snapshot.monthlyContribution, 200);
+    await store.handleUserReply(`确认画像 ${await id()} 全部`);
+    assert.equal(store.snapshot.monthlyContribution, 300);
+    await store.propose({ monthlyContribution: null }, { monthlyContribution: "清除月投入" }, ["清除月投入"]);
+    await store.handleUserReply(`取消画像 ${await id()}`);
+    assert.equal(store.snapshot.monthlyContribution, 300);
+    await store.propose({ monthlyContribution: null }, { monthlyContribution: "清除月投入" }, ["清除月投入"]);
+    await store.handleUserReply(`确认画像 ${await id()} 全部`);
+    assert.equal(store.snapshot.monthlyContribution, undefined);
+    assert.equal((await JsonUserProfileStore.open({ cwd: directory })).snapshot.monthlyContribution, undefined);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

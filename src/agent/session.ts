@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { AgentMessage } from "./runtime.js";
+import type { AgentMessage, AgentToolCall } from "./runtime.js";
 
 export interface SessionToolDefinition {
   readonly name: string;
@@ -54,6 +54,11 @@ const messageEntrySchema = z.object({
   message: z.object({
     role: z.enum(["system", "user", "assistant", "tool"]),
     content: z.string(),
+    toolCalls: z.array(z.object({
+      id: z.string().min(1),
+      name: z.string().min(1),
+      input: z.unknown(),
+    })).optional(),
     toolName: z.string().optional(),
     toolInput: z.unknown().optional(),
     toolCallId: z.string().optional(),
@@ -177,19 +182,24 @@ export class JsonlSessionStore implements AgentSession {
 }
 
 function parseEntry(raw: unknown, filePath: string): SessionEntry {
-  if (typeof raw !== "object" || raw === null || !("type" in raw)) {
+  if (!isRecord(raw) || !("type" in raw)) {
     throw new Error(`会话记录缺少 type: ${filePath}`);
   }
-  const type = (raw as { readonly type?: unknown }).type;
+  const type = raw.type;
   if (type === "message") return messageEntrySchema.parse(raw);
   if (type === "context") return contextEntrySchema.parse(raw);
   throw new Error(`不支持的会话记录类型: ${String(type)}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function normalizeMessage(message: AgentMessage): AgentMessage {
   return {
     role: message.role,
     content: message.content,
+    ...(message.toolCalls ? { toolCalls: message.toolCalls.map(normalizeToolCall) } : {}),
     ...(message.toolName ? { toolName: message.toolName } : {}),
     ...(message.toolInput !== undefined ? { toolInput: message.toolInput } : {}),
     ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
@@ -201,11 +211,16 @@ function normalizePersistedMessage(message: z.infer<typeof messageEntrySchema>["
   return {
     role: message.role,
     content: message.content,
+    ...(message.toolCalls ? { toolCalls: message.toolCalls.map(normalizeToolCall) } : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
     ...(message.toolInput !== undefined ? { toolInput: message.toolInput } : {}),
     ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
     ...(message.contextMetadata !== undefined ? { contextMetadata: normalizeContextMetadata(message.contextMetadata) } : {}),
   };
+}
+
+function normalizeToolCall(call: { readonly id: string; readonly name: string; readonly input?: unknown }): AgentToolCall {
+  return { id: call.id, name: call.name, input: call.input };
 }
 
 function normalizeContextMetadata(metadata: NonNullable<z.infer<typeof messageEntrySchema>["message"]["contextMetadata"]>): NonNullable<AgentMessage["contextMetadata"]> {
@@ -229,5 +244,5 @@ async function resolveSessionPath(options: OpenSessionOptions): Promise<string> 
 }
 
 function isMissingFile(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && (error as { readonly code?: unknown }).code === "ENOENT";
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }

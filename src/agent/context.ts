@@ -173,6 +173,8 @@ function summarizeTurns(messages: readonly AgentMessage[], noise: ReadonlySet<nu
       lines.push(`轮次 ${turn} 用户任务：${previewText(message.content, 180)}`);
     } else if (message.role === "assistant" && message.toolName) {
       lines.push(`轮次 ${turn} 调用工具：${message.toolName}(${previewText(JSON.stringify(message.toolInput ?? {}), 120)})`);
+    } else if (message.role === "assistant" && message.toolCalls) {
+      lines.push(`轮次 ${turn} 调用工具：${message.toolCalls.map(call => `${call.name}(${previewText(JSON.stringify(call.input), 120)})`).join("、")}`);
     } else if (message.role === "tool") {
       lines.push(`轮次 ${turn} 工具结果：${message.toolName ?? "unknown"}；${previewText(message.content, 180)}`);
     } else if (message.role === "assistant") {
@@ -190,8 +192,13 @@ function previewText(value: string, tokenBudget: number): string {
 /** 估算消息 token 数；实际请求仍由具体模型的 tokenizer 决定。 */
 export function estimateTokens(messages: readonly AgentMessage[]): number {
   const characters = messages.reduce(
-    (total, message) => total + message.content.length + JSON.stringify(message.toolInput ?? "").length + 32,
+    (total, message) => total + estimatedContentLength(message) + JSON.stringify(message.toolCalls ?? message.toolInput ?? "").length + 32,
     0,
   );
   return Math.max(1, Math.ceil(characters / 4));
+}
+
+function estimatedContentLength(message: AgentMessage): number {
+  if (!message.contextMetadata?.preview) return message.content.length;
+  return `[工具结果已归档：${message.contextMetadata.archivePath ?? "本地归档"}]\n${message.contextMetadata.preview}`.length;
 }

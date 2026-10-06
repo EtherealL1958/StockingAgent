@@ -6,7 +6,7 @@ const profileSchema = z.object({
   monthlyContribution: z.number().finite().nonnegative(),
   horizonYears: z.number().finite().positive(),
   riskLevel: z.enum(["low", "medium", "high"]),
-  maxDrawdown: z.number().finite().gt(0).lte(1),
+  maxDrawdown: z.number().finite().gte(0).lte(1),
   emergencyCashRequired: z.number().finite().nonnegative(),
   cashReserveRatio: z.number().finite().gte(0).lte(1).optional(),
 });

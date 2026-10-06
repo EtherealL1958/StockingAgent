@@ -33,6 +33,14 @@ The target user has limited capital and prioritizes risk control over speculativ
 - Do not add backward-compatibility layers unless required by persisted data, public APIs, or explicit user instruction.
 - When the user asks a question, answer it before making implementation changes.
 
+### Artifact and file output
+
+- Before calling `write`, determine the task's intended deliverables and whether the user requested a file at all.
+- Treat one research request as having one primary report by default. Put follow-up analysis into the existing report unless the user explicitly requests a separate file or the deliverables are clearly independent.
+- If it is unclear whether a new file should be created or an existing report should be updated, ask the user before writing.
+- Do not create multiple files containing overlapping conclusions merely because the conversation has multiple turns.
+- When creating a new file is justified, explain its purpose in the final response and keep its scope distinct from existing artifacts.
+
 ### Agent development reference
 
 - When creating a new Agent module, tool, memory component, planner, context manager, evaluator, or orchestration workflow, first read the relevant sections of `AI-Agents-in-Depth-zh-CN.pdf` and use its design patterns as a reference.
@@ -71,6 +79,8 @@ Do not collapse these responsibilities into prompts.
 Prefer one orchestrator with tools over unnecessary multi-agent complexity.
 
 Tools should have narrow, structured inputs and outputs.
+
+File-writing tools must preserve this artifact policy. Their availability to the model is not approval to create an arbitrary number of documents.
 
 Prefer:
 
