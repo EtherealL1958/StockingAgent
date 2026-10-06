@@ -59,6 +59,40 @@ export function buildChatCompletionsToolDefinitions(): readonly ChatToolDefiniti
     {
       type: "function",
       function: {
+        name: "get_user_profile",
+        description: "制定个性化投资计划、组合配置或风险解释前使用；返回已确认的持久化用户画像和缺失字段。不要用它获取行情或持仓，也不要把猜测写入画像。",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "update_user_profile",
+        description: "用户明确提供或确认资金、期限、风险和投资偏好后使用；必须 confirmed=true 才会持久化，false 只要求确认。null 表示明确清除字段；不会执行交易或修改持仓。",
+        parameters: {
+          type: "object",
+          properties: {
+            confirmed: { type: "boolean", description: "用户是否已明确提供或确认这些字段；只有 true 才写入" },
+            investableCash: { type: ["number", "null"], minimum: 0, description: "可投资资金，例如 10000 元" },
+            monthlyContribution: { type: ["number", "null"], minimum: 0, description: "每月可投入金额，例如 500 元" },
+            horizonYears: { type: ["number", "null"], exclusiveMinimum: 0, description: "投资期限，例如 3 年" },
+            riskLevel: { type: ["string", "null"], enum: ["low", "medium", "high", null], description: "风险承受能力" },
+            maxDrawdown: { type: ["number", "null"], minimum: 0, maximum: 1, description: "最大可接受回撤，例如 0.1 表示 10%" },
+            emergencyCashRequired: { type: ["number", "null"], minimum: 0, description: "需要保留的应急现金，例如 20000 元" },
+            investmentGoal: { type: ["string", "null"], enum: ["capital_preservation", "steady_growth", "long_term_growth", null], description: "投资目标" },
+            experienceLevel: { type: ["string", "null"], enum: ["beginner", "intermediate", "advanced", null], description: "投资经验" },
+            preferredAssets: { type: ["array", "null"], items: { type: "string", enum: ["broad_etf", "industry_etf", "stock", "bond", "cash"] }, description: "偏好资产类型" },
+            avoidedSectors: { type: ["array", "null"], items: { type: "string" }, description: "希望回避的行业" },
+            notes: { type: ["array", "null"], items: { type: "string" }, description: "长期投资约束或偏好" },
+          },
+          required: ["confirmed"],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "read",
         description: "需要查看完整 Skill、文本财报或研究笔记时使用，例如 path='skills/a-share-research/SKILL.md'。只接受项目相对路径和 UTF-8 文本，不解析 PDF/图片/目录，不接受 .env；默认最多 400 行。返回字段示例：{path:'reports/2025-q4.txt',startLine:1,endLine:20,truncated:false,content:'...'}。",
         parameters: { type: "object", properties: { path: { type: "string", description: "项目相对路径，例如 reports/2025-q4.txt；不要传绝对路径或 .env" }, offset: { type: "integer", minimum: 1, description: "1-based 起始行，例如 401" }, limit: { type: "integer", minimum: 1, maximum: 400, description: "读取行数，例如 20；默认 400，最大 400" } }, required: ["path"], additionalProperties: false },
@@ -204,6 +238,36 @@ export class ChatCompletionsResearchModel implements AgentModel {
       ...(message.content ? { content: message.content } : {}),
       toolCall: { id: call.id, name: call.function.name, input },
     };
+  }
+
+  public async summarizeContext(messages: readonly AgentMessage[]): Promise<string> {
+    const response = await this.fetchFn(this.baseUrl.endsWith("/chat/completions") ? this.baseUrl : `${this.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${this.modelOptions.apiKey}`,
+        "content-type": "application/json",
+      },
+      signal: AbortSignal.timeout(this.timeoutMs),
+      body: JSON.stringify({
+        model: this.modelOptions.model,
+        temperature: 0,
+        messages: [
+          {
+            role: "system",
+            content: "你是上下文归档器。把给定的 A 股研究对话压缩为结构化摘要，必须保留证券代码、报告期、数据源、日期、数字、用户约束、工具错误、关键决策、未解决问题和投资逻辑失效条件。不要创造原文没有的事实；缺失信息写‘未提供’。按‘用户任务、已验证事实、工具与结果、决策与理由、风险与约束、待办’输出。",
+          },
+          {
+            role: "user",
+            content: messages.map(message => `${message.role}: ${message.content}`).join("\n"),
+          },
+        ],
+      }),
+    });
+    if (!response.ok) throw new Error(`上下文压缩请求失败: HTTP ${response.status}`);
+    const payload = chatCompletionResponseSchema.parse(await response.json());
+    const content = payload.choices[0]?.message.content;
+    if (!content) throw new Error("上下文压缩没有返回摘要");
+    return content;
   }
 
   private requestBody(messages: readonly AgentMessage[], stream: boolean): Record<string, unknown> {

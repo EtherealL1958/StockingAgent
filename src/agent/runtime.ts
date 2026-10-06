@@ -9,6 +9,11 @@ export type AgentMessage = {
   readonly toolName?: string;
   readonly toolInput?: unknown;
   readonly toolCallId?: string;
+  readonly contextMetadata?: {
+    readonly archivePath?: string;
+    readonly preview?: string;
+    readonly importance?: "high" | "normal" | "low";
+  };
 };
 
 export interface ModelResponse {
@@ -25,6 +30,8 @@ export interface AgentModel {
   /** 模型可接受的最大上下文窗口，单位为 token。 */
   readonly contextWindow?: number;
   respond(messages: readonly AgentMessage[], callbacks?: AgentResponseCallbacks): Promise<ModelResponse>;
+  /** 可选的最后手段：将较早上下文压缩为可审查的结构化摘要。 */
+  summarizeContext?(messages: readonly AgentMessage[]): Promise<string>;
 }
 
 /** 模型可公开的增量内容；不要求模型暴露隐藏思维链。 */
@@ -37,6 +44,8 @@ export interface ResearchAgentOptions {
   readonly maxTurns?: number;
   readonly session?: AgentSession;
   readonly contextManager?: ContextManager;
+  /** 每次模型回合前重新读取的持久化用户/组合上下文。 */
+  readonly dynamicContextProvider?: () => Promise<string | undefined> | string | undefined;
 }
 
 export type AgentEvent = {
@@ -67,12 +76,14 @@ export class ResearchAgent {
     this.maxTurns = options.maxTurns ?? 12;
     this.session = options.session;
     this.contextManager = options.contextManager;
+    this.dynamicContextProvider = options.dynamicContextProvider;
     this.history = [...(options.session?.history ?? [])];
   }
 
   private readonly maxTurns: number;
   private readonly session: AgentSession | undefined;
   private readonly contextManager: ContextManager | undefined;
+  private readonly dynamicContextProvider: ResearchAgentOptions["dynamicContextProvider"];
   private readonly history: AgentMessage[];
 
   public on(listener: (event: AgentEvent) => void): () => void {
@@ -96,7 +107,13 @@ export class ResearchAgent {
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       this.emit({ type: "turn_start" });
-      const context = this.contextManager?.build(this.history) ?? this.history;
+      const historyContext = this.contextManager?.buildAsync
+        ? await this.contextManager.buildAsync(this.history, this.model.summarizeContext)
+        : this.contextManager?.build(this.history) ?? this.history;
+      const dynamicContext = await this.dynamicContextProvider?.();
+      const context = dynamicContext
+        ? [{ role: "system" as const, content: dynamicContext }, ...historyContext]
+        : historyContext;
       const response = await this.model.respond(context, {
         onThinkingDelta: delta => this.emit({ type: "thinking_delta", delta }),
         onTextDelta: delta => this.emit({ type: "text_delta", delta }),
@@ -146,13 +163,17 @@ export class ResearchAgent {
         result = toolError("tool_execution_error", error);
       }
       this.emit({ type: "tool_end", toolName: tool.name, result });
-      await this.appendMessage({
+      const toolMessage: AgentMessage = {
         role: "tool",
         content: JSON.stringify(result),
         toolName: tool.name,
         toolInput: input,
         ...(response.toolCall.id ? { toolCallId: response.toolCall.id } : {}),
-      });
+      };
+      const preparedToolMessage = this.contextManager?.prepareMessage
+        ? await this.contextManager.prepareMessage(toolMessage)
+        : toolMessage;
+      await this.appendMessage(preparedToolMessage);
     }
 
     throw new Error(`研究步骤超过上限（${this.maxTurns} 个模型回合）`);

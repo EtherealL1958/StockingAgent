@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
@@ -15,6 +15,8 @@ import { MockMarketDataProvider } from "../src/providers/market-data.js";
 import { buildMarketTools } from "../src/tools/market-tools.js";
 import { TavilyWebSearchProvider, type WebSearchInput } from "../src/providers/web-search.js";
 import { defineTool } from "../src/tools/tool.js";
+import { JsonUserProfileStore } from "../src/memory/user-profile.js";
+import { buildUserMemoryTools } from "../src/tools/user-memory-tools.js";
 
 const security: Security = {
   ticker: "510300",
@@ -182,6 +184,48 @@ test("agent sends restored history while keeping the full session persisted", as
   }
 });
 
+test("user profile memory requires confirmation, persists, and is injected into later model turns", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-user-profile-"));
+  try {
+    const store = await JsonUserProfileStore.open({ cwd: directory, filePath: join(directory, "profile.json"), userId: "user-1" });
+    const tools = buildUserMemoryTools(store);
+    assert.deepEqual(tools.map(tool => tool.name), ["get_user_profile", "update_user_profile"]);
+    assert.equal(store.toInvestorProfile(), undefined);
+    assert.ok(store.missingFields.length >= 6);
+
+    const beforeConfirmation = store.snapshot;
+    assert.equal(beforeConfirmation.investableCash, undefined);
+
+    const updated = await store.update({
+      investableCash: 10_000,
+      monthlyContribution: 500,
+      horizonYears: 5,
+      riskLevel: "low",
+      maxDrawdown: 0.1,
+      emergencyCashRequired: 20_000,
+      investmentGoal: "steady_growth",
+    });
+    assert.equal(updated.investableCash, 10_000);
+    assert.equal(store.toInvestorProfile()?.investableCash, 10_000);
+
+    const reopened = await JsonUserProfileStore.open({ cwd: directory, filePath: join(directory, "profile.json"), userId: "user-1" });
+    assert.equal(reopened.snapshot.monthlyContribution, 500);
+    let seenContext: readonly { role: string; content: string }[] = [];
+    const agent = new ResearchAgent([], {
+      respond: async messages => {
+        seenContext = messages;
+        return { done: true, content: "已读取用户画像" };
+      },
+    }, { dynamicContextProvider: () => reopened.toPromptContext() });
+    await agent.run("制定我的长期计划");
+    assert.equal(seenContext[0]?.role, "system");
+    assert.match(seenContext[0]?.content ?? "", /investableCash/);
+    assert.match(seenContext[0]?.content ?? "", /10000/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("context manager trims only the model projection, not persisted history", () => {
   const history = [
     { role: "user" as const, content: "旧问题" },
@@ -195,6 +239,65 @@ test("context manager trims only the model projection, not persisted history", (
   assert.match(projected[0]?.content ?? "", /已省略较早/);
   assert.deepEqual(projected.slice(-2), history.slice(-2));
   assert.equal(history.length, 4);
+});
+
+test("context manager archives oversized tool results and exposes only a preview", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "stocking-context-archive-"));
+  try {
+    const manager = new SlidingWindowContextManager({
+      contextWindow: 10_000,
+      reserveTokens: 100,
+      keepRecentTokens: 1_000,
+      maxToolResultTokens: 5,
+      toolPreviewTokens: 8,
+      archiveDirectory: directory,
+    });
+    const prepared = await manager.prepareMessage?.({
+      role: "tool",
+      content: JSON.stringify({ results: "a".repeat(200) }),
+      toolName: "web_search",
+      toolCallId: "call-archive",
+    });
+    assert.ok(prepared?.contextMetadata?.archivePath);
+    assert.match(prepared?.contextMetadata?.preview ?? "", /预览已截断/);
+    const archived = JSON.parse(await readFile(prepared!.contextMetadata!.archivePath!, "utf8")) as { message?: { content?: string } };
+    assert.equal(archived.message?.content, prepared?.content);
+    const projected = manager.build([{ role: "user", content: "查询" }, prepared!]);
+    assert.match(projected[1]?.content ?? "", /工具结果已归档/);
+    assert.doesNotMatch(projected[1]?.content ?? "", /a{100}/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("context manager uses LLM compression as a last resort and opens a circuit after failures", async () => {
+  const history = [
+    { role: "user" as const, content: "旧任务" },
+    { role: "assistant" as const, content: "旧结论" },
+    { role: "user" as const, content: "新任务" },
+    { role: "assistant" as const, content: "x".repeat(300) },
+  ];
+  const manager = new SlidingWindowContextManager({ contextWindow: 30, reserveTokens: 4, keepRecentTokens: 1, maxCompressionFailures: 3 });
+  let attempts = 0;
+  const failingCompressor = async () => {
+    attempts += 1;
+    throw new Error("compression unavailable");
+  };
+  for (let index = 0; index < 4; index += 1) await manager.buildAsync?.(history, failingCompressor);
+  assert.equal(attempts, 3);
+});
+
+test("context manager keeps a structured LLM summary when recent history overflows", async () => {
+  const history = [
+    { role: "user" as const, content: "旧任务" },
+    { role: "assistant" as const, content: "旧结论" },
+    { role: "user" as const, content: "新任务" },
+    { role: "assistant" as const, content: "x".repeat(300) },
+  ];
+  const manager = new SlidingWindowContextManager({ contextWindow: 80, reserveTokens: 4, keepRecentTokens: 1 });
+  const projected = await manager.buildAsync?.(history, async () => "保留 600519、报告期 2025-4、数据源同花顺和 NO_TRADE 约束");
+  assert.match(projected?.[0]?.content ?? "", /全量压缩摘要/);
+  assert.match(projected?.[0]?.content ?? "", /600519/);
 });
 
 test("Chat Completions model streams public reasoning and text deltas", async () => {

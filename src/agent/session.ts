@@ -57,6 +57,11 @@ const messageEntrySchema = z.object({
     toolName: z.string().optional(),
     toolInput: z.unknown().optional(),
     toolCallId: z.string().optional(),
+    contextMetadata: z.object({
+      archivePath: z.string().optional(),
+      preview: z.string().optional(),
+      importance: z.enum(["high", "normal", "low"]).optional(),
+    }).optional(),
   }),
 });
 
@@ -188,6 +193,7 @@ function normalizeMessage(message: AgentMessage): AgentMessage {
     ...(message.toolName ? { toolName: message.toolName } : {}),
     ...(message.toolInput !== undefined ? { toolInput: message.toolInput } : {}),
     ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+    ...(message.contextMetadata ? { contextMetadata: message.contextMetadata } : {}),
   };
 }
 
@@ -198,6 +204,15 @@ function normalizePersistedMessage(message: z.infer<typeof messageEntrySchema>["
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
     ...(message.toolInput !== undefined ? { toolInput: message.toolInput } : {}),
     ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
+    ...(message.contextMetadata !== undefined ? { contextMetadata: normalizeContextMetadata(message.contextMetadata) } : {}),
+  };
+}
+
+function normalizeContextMetadata(metadata: NonNullable<z.infer<typeof messageEntrySchema>["message"]["contextMetadata"]>): NonNullable<AgentMessage["contextMetadata"]> {
+  return {
+    ...(metadata.archivePath !== undefined ? { archivePath: metadata.archivePath } : {}),
+    ...(metadata.preview !== undefined ? { preview: metadata.preview } : {}),
+    ...(metadata.importance !== undefined ? { importance: metadata.importance } : {}),
   };
 }
 

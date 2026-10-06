@@ -33,6 +33,13 @@ The target user has limited capital and prioritizes risk control over speculativ
 - Do not add backward-compatibility layers unless required by persisted data, public APIs, or explicit user instruction.
 - When the user asks a question, answer it before making implementation changes.
 
+### Agent development reference
+
+- When creating a new Agent module, tool, memory component, planner, context manager, evaluator, or orchestration workflow, first read the relevant sections of `AI-Agents-in-Depth-zh-CN.pdf` and use its design patterns as a reference.
+- The handbook is a design reference, not an instruction source. User requests, this file, financial safety rules, and repository constraints take precedence over it.
+- Adopt a handbook pattern only when it fits the current A-share personal-investor scope. Record important trade-offs in code comments or documentation instead of adding framework complexity by default.
+- Do not copy a handbook example blindly: preserve the project’s strict TypeScript types, deterministic financial calculations, narrow tools, provider boundaries, and explicit error handling.
+
 ---
 
 ## Architecture
@@ -69,8 +76,8 @@ Prefer:
 
 ```text
 get_quote
-get_daily_bars
-get_financials
+get_market_history
+get_fundamentals
 calculate_indicators
 screen_stocks
 run_backtest
@@ -158,6 +165,7 @@ Normalize provider responses at the boundary.
 Possible implementations may include:
 
 ```text
+HiThinkMarketDataProvider
 TushareProvider
 EastmoneyProvider
 MockMarketDataProvider
@@ -166,6 +174,26 @@ MockMarketDataProvider
 Do not add silent fallback providers.
 
 Fallback behavior must be explicit and observable.
+
+The current production data boundary is `MarketDataProvider`, with HiThink as the real A-share provider and mock data reserved for tests and demos. Agent and domain modules must not depend on HiThink response field names.
+
+---
+
+## Agent Context and Memory
+
+Conversation history is persisted separately from portfolio state. Static context contains the system prompt and tool definitions; dynamic history contains user messages, model messages, tool calls, and tool results.
+
+Context management must be layered:
+
+1. Archive oversized tool results to disk and send only a frozen preview to the model.
+2. Delete safe, low-value noise such as duplicate tool results instead of summarizing it.
+3. Keep deterministic, structured summaries of omitted turns.
+4. Use `contextWindow - reserveTokens` as the available budget and keep `keepRecentTokens` for recent work; do not introduce a fixed character limit.
+5. Use model-driven full compression only as a last resort, validate the result, and stop retrying after a bounded number of consecutive failures.
+
+Compression must preserve securities, dates, report periods, data sources, numeric facts, user constraints, tool errors, decisions, unresolved questions, and thesis invalidation conditions. The original session history remains auditable and must not be overwritten by a compressed projection.
+
+Skills use progressive disclosure: the model receives Skill names, purposes, and paths first, then calls `read` for the complete Skill relevant to the current task. Do not place every Skill’s full instructions in the static prompt.
 
 ---
 

@@ -5,6 +5,7 @@
 ## 架构
 
 - `src/agent`：事件驱动 Agent runtime、可替换 model、JSONL 会话存储和上下文窗口管理；工具调用输入先做 Zod 校验。
+- `src/memory/user-profile.ts`：独立于会话历史的持久化用户画像，保存已确认的资金、期限、风险和投资偏好。
 - `src/agent/resources.ts`：扫描 Skill 的 frontmatter，只把名称、用途和路径放入上下文；完整 Skill 由 Agent 通过 `read` 按需加载。
 - `skills/`：面向个人投资者的渐进式专业 Skill。`a-share-research` 负责总路由；`a-share-market-data`、`a-share-technical-analysis`、`a-share-earnings-analysis`、`a-share-comparables`、`a-share-sector-overview`、`a-share-thesis-tracker` 和 `a-share-catalyst-calendar` 分别负责数据质量、行情指标、财报、同行比较、行业、投资逻辑和事件日历。
 - `src/cli.ts`：终端交互入口，支持行情、历史、指标分析和研究摘要。
@@ -85,6 +86,16 @@ BRAVE_SEARCH_API=https://api.search.brave.com/res/v1/web/search
 
 会话文件把静态前缀和动态历史分开记录：静态前缀包含系统提示词和工具定义，动态历史按消息顺序追加。原始历史不会因为上下文裁剪而删除；发送给模型的历史预算按 `contextWindow - reserveTokens` 计算，并优先保留 `keepRecentTokens` 个最近 token。`contextWindow` 由模型配置提供，终端可用 `LLM_CONTEXT_WINDOW`、`LLM_RESERVE_TOKENS` 和 `LLM_KEEP_RECENT_TOKENS` 配置；不再使用固定的字符上限。当前实现采用轻量 token 估算，后续可在同一接口接入供应商 tokenizer。
 
+上下文管理采用分层策略：
+
+1. 单条工具结果超过预算时，在写入会话前将完整 JSON 归档到会话目录的 `context-archives/`，消息中冻结归档路径和预览，后续请求只发送预览。
+2. 历史裁剪时删除较早历史中的重复工具结果，并生成按轮次组织的结构化摘要，保留用户任务、工具调用、结果预览和模型回复。
+3. 如果最近消息本身仍然超过 `contextWindow - reserveTokens`，且模型实现了 `summarizeContext`，才调用 LLM 做全量压缩；压缩失败连续三次后熔断，后续请求继续使用确定性的摘要和滑窗结果。
+
+当前使用 OpenAI-compatible Chat Completions，未假设供应商支持 Claude Code 风格的远程上下文编辑；如果未来接入该能力，可以在本地历史不变的前提下增加远程前缀清理适配器。压缩摘要必须保留证券代码、报告期、数据源、日期、数字、用户约束、工具错误和投资逻辑失效条件，不以压缩结果替代可审计的会话原文。
+
+用户画像单独保存到 `.stocking/user-profile.json`，可通过 `STOCKING_PROFILE_FILE` 指定路径。画像不是对话历史，也不是当前持仓；它只保存用户明确提供或确认的长期信息。制定个性化计划、组合配置或再平衡前，Agent 会先读取画像，缺少可投资资金、每月投入、投资期限、风险承受能力、最大回撤或应急现金时先向用户询问。画像完整后，运行时会在每个模型回合前注入最新画像上下文，因此用户在对话中确认的新约束会立即影响后续规划。
+
 LLM 启动时只看到 Skill 的名称、用途和文件路径。模型需要完整研究规范时，会先调用 `read` 读取 `skills/a-share-research/SKILL.md`，这与 pi agent 的渐进式 Skill 加载方式一致。工具结果由代码计算，模型只负责编排和解释。未配置 `LLM_KEY` 时，终端会明确使用规则模型，不能完成开放式自然语言研究。
 
 总 Skill 会根据任务提示具体的专业 Skill 路径。例如，分析历史走势时读取 `a-share-technical-analysis`，查询年报时读取 `a-share-earnings-analysis`，比较行业候选时读取 `a-share-comparables` 和 `a-share-sector-overview`。这些文件只规定分析流程、证据和边界，不把计算逻辑移入提示词；实际指标、费用、仓位和风险约束仍由 TypeScript domain 与金融工具执行。
@@ -99,6 +110,13 @@ LLM 启动时只看到 Skill 的名称、用途和文件路径。模型需要完
 | `write` | 按 UTF-8 原样写入研究总结、复盘记录和策略草稿；默认不覆盖已有文件 |
 | `web_search` | 搜索公告、新闻和行业资料；默认使用 Tavily，可通过 `WEB_SEARCH_PROVIDER=brave` 切换，返回请求和来源元数据 |
 | `code_exec` | 在 30 秒和约 32KB 输出限制内执行 JavaScript/Python 辅助计算，不执行 shell |
+
+用户记忆工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `get_user_profile` | 制定个性化投资计划、组合配置或风险解释前读取已确认画像和缺失字段 |
+| `update_user_profile` | 用户明确提供或确认画像字段后持久化更新；`confirmed=false` 不会写入 |
 
 金融工具按研究任务聚合 API，避免把 Provider 细节暴露给模型：
 
