@@ -9,6 +9,8 @@ summary: 用确定性指标分析 A 股趋势、波动和回撤，不把指标�
 
 当用户询问“走势、趋势、强弱、波动、回撤、是否适合观察”时使用 `get_market_history`。需要逐根日线时明确传 `includeBars=true`。
 
+若要将指标转成策略，按需读取 [策略设计](../../knowledge/topics/strategy-design.md) 与 [回测验证](../../knowledge/topics/backtest-validation.md)；这些知识不能证明指标在当前市场有效。
+
 ## 指标解释
 
 - 趋势：比较 MA20、MA60、MA120 与最新收盘价，说明趋势方向和可能的震荡状态。

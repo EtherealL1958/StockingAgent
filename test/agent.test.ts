@@ -655,7 +655,7 @@ test("profile regression: model confirmation cannot turn idle cash or ETF sugges
     const audited = JSON.parse(await readFile(store.filePath, "utf8"));
     assert.equal(audited.confirmations.investableCash.quote, userText);
     assert.equal(audited.pending, undefined);
-    assert.match(await reopened.handleUserReply(`确认画像 ${persisted.pending.id} 全部`) ?? "", /过期/);
+    assert.match((await reopened.handleUserReply(`确认画像 ${persisted.pending.id} 全部`))?.message ?? "", /过期/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -696,18 +696,17 @@ test("runtime pauses on a profile proposal and only trusted user replies commit 
         assert.match(messages.find(message => message.role === "system")?.content ?? "", /"monthlyContribution":200/);
         return { done: true, content: "按已确认的月投入规划" };
       },
-    }, { handleUserReply: input => store.handleUserReply(input), dynamicContextProvider: () => store.toPromptContext() });
+    }, { handleUserReply: (input, displayedPrompt) => store.handleUserReply(input, displayedPrompt), dynamicContextProvider: () => store.toPromptContext() });
     const result = await agent.run(source);
     assert.equal(calls, 1);
     assert.match(result.answer, /每月投入/);
     assert.equal(store.snapshot.monthlyContribution, undefined);
     assert.equal(result.messages.filter(m => m.role === "tool").length, 1);
     const pending = JSON.parse(await readFile(store.filePath, "utf8")).pending;
-    await agent.run(`确认画像 ${pending.id} 全部`);
-    assert.equal(calls, 1); // The model is not asked whether the user's confirmation is valid.
+    const continued = await agent.run(`确认画像 ${pending.id} 全部`);
+    assert.equal(calls, 2); // Code commits first, then the model continues with confirmed state.
     assert.equal(store.snapshot.monthlyContribution, 200);
-    await agent.run("继续规划");
-    assert.equal(calls, 2);
+    assert.equal(continued.answer, "按已确认的月投入规划");
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

@@ -56,7 +56,10 @@ export interface AgentResponseCallbacks {
 export interface ResearchAgentOptions {
   readonly maxTurns?: number;
   /** Handle explicit user replies outside model-controlled tool arguments. */
-  readonly handleUserReply?: (input: string) => Promise<string | undefined>;
+  readonly handleUserReply?: (input: string, displayedPrompt?: string) => Promise<{
+    readonly message: string;
+    readonly continueTask: boolean;
+  } | undefined>;
   readonly session?: AgentSession;
   readonly contextManager?: ContextManager;
   /** 每次模型回合前重新读取的持久化用户/组合上下文。 */
@@ -120,15 +123,21 @@ export class ResearchAgent {
     readonly answer: string;
     readonly messages: readonly AgentMessage[];
   }> {
+    const previousMessage = this.history.at(-1);
+    const displayedPrompt = previousMessage?.role === "assistant" && !previousMessage.toolCalls?.length
+      ? previousMessage.content : undefined;
     const userMessage: AgentMessage = { role: "user", content: userInput };
     await this.appendMessage(userMessage);
     this.emit({ type: "agent_start" });
-    const directReply = await this.handleUserReply?.(userInput);
+    const directReply = await this.handleUserReply?.(userInput, displayedPrompt);
     if (directReply) {
-      await this.appendMessage({ role: "assistant", content: directReply });
-      this.emit({ type: "text_delta", delta: directReply });
-      this.emit({ type: "agent_end" });
-      return { answer: directReply, messages: this.history };
+      await this.appendMessage({ role: "assistant", content: directReply.message });
+      this.emit({ type: "text_delta", delta: `${directReply.message}\n\n` });
+      this.emit({ type: "response_end", message: { role: "assistant", content: directReply.message }, final: !directReply.continueTask });
+      if (!directReply.continueTask) {
+        this.emit({ type: "agent_end" });
+        return { answer: directReply.message, messages: this.history };
+      }
     }
 
     for (let turn = 0; turn < this.maxTurns; turn += 1) {

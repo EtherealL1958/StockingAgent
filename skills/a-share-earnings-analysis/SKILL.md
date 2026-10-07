@@ -9,6 +9,8 @@ summary: 面向个人投资者的 A 股年报和季报分析，区分事实、�
 
 当用户要求查询年报、季报、营收、利润、ROE、现金流、负债或经营质量时使用。调用 `get_fundamentals` 时必须显式传入报告期，例如 `report=2025-4`。
 
+按需读取 [基本面知识](../../knowledge/topics/fundamentals.md)；涉及历史可见性时补读 [市场规则与数据口径](../../knowledge/topics/market-rules.md)。知识库中的研究问题不能当作公司的已知事实。
+
 ## 分析顺序
 
 1. 先列出公司、报告期、数据源和可用字段。

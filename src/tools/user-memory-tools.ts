@@ -38,7 +38,7 @@ export function buildUserMemoryTools(store: JsonUserProfileStore) {
   return [
     defineTool({
       name: "get_user_profile",
-      description: "制定个性化投资计划前读取用户画像。只返回有逐字段用户确认记录的事实；missingFields 是待询问项，unverifiedFields 是旧记录中无证据的字段。不是持仓、行情或推测。",
+      description: "制定个性化投资计划前读取用户画像。profile 只返回有逐字段用户确认记录的事实，已确认且未变化的值直接复用。missingFields 是待补充项，unverifiedFields 是旧记录中无有效确认记录的字段，不表示用户从未回答。pendingConfirmation 是已生成的核对清单；已有提案时不要重复创建。不是持仓、行情或推测。",
       input: z.object({}).strict(),
       modelParameters: EMPTY_PARAMETERS,
       execute: async () => ({
@@ -52,17 +52,16 @@ export function buildUserMemoryTools(store: JsonUserProfileStore) {
     }),
     defineTool({
       name: "update_user_profile",
-      description: "用户提供画像信息时提出待确认变更，例如 changes={monthlyContribution:200}, evidence={monthlyContribution:'每月200元'}。每个字段必须引用用户原话；不接受 confirmed 或模型自证。闲钱不等于应急金为0，推荐ETF不等于用户偏好。null 表示候选清除；数组整体替换。仅创建候选，系统展示明细并等待用户选择确认后才用于规划。",
+      description: "收集到用户明确提供的画像信息后，用本工具生成一次核对清单；不要先在自然语言中要求确认再调用。例如 changes={monthlyContribution:200}, evidence={monthlyContribution:'每月200元'}。每个字段必须逐字引用用户消息，不得省略或拼接；用户回复‘其余不变’时可引用该原话并结合明确的上文提出候选，但不能自动确认。不接受 confirmed 或模型自证。闲钱不等于应急金为0，推荐ETF不等于用户偏好。null 表示候选清除；数组整体替换。更正会合并到现有提案，仅提交变化字段即可；与已确认值相同的字段会移除，并在 ignoredFields 中明确返回；相同提案复用原编号。返回 updated:false、requiresConfirmation、ignoredFields、message。requiresConfirmation=true 时系统展示并暂停，用户可回复‘确认’、‘确认 1,2’或‘取消画像’；false 时没有新变更，直接继续研究，不再要求确认。",
       input: z.object({ changes: profilePatchSchema, evidence: profileEvidenceSchema }).strict(),
       modelParameters: PROFILE_UPDATE_PARAMETERS,
       execute: async ({ changes, evidence }, context) => ({
         available: true,
         updated: false,
-        requiresConfirmation: true,
-        message: await store.propose(changes, evidence, context?.userMessages ?? []),
+        ...await store.propose(changes, evidence, context?.userMessages ?? []),
       }),
       // Stop this model turn so the exact proposed values, rather than a paraphrase, are shown.
-      userResponse: result => result.message,
+      userResponse: result => result.requiresConfirmation ? result.message : "",
     }),
   ] as const;
 }

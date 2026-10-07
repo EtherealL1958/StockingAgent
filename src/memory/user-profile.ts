@@ -77,6 +77,12 @@ export interface OpenUserProfileOptions {
   readonly userId?: string;
 }
 
+export interface ProfileProposalResult {
+  readonly requiresConfirmation: boolean;
+  readonly ignoredFields: readonly ProfileField[];
+  readonly message: string;
+}
+
 export class JsonUserProfileStore {
   private constructor(private profile: UserProfile, public readonly filePath: string) {}
 
@@ -117,7 +123,7 @@ export class JsonUserProfileStore {
   }
 
   /** A model can propose changes; it cannot confirm its own proposal. */
-  public async propose(patchInput: unknown, evidenceInput: unknown, userMessages: readonly string[]): Promise<string> {
+  public async propose(patchInput: unknown, evidenceInput: unknown, userMessages: readonly string[]): Promise<ProfileProposalResult> {
     const patch = profilePatchSchema.parse(patchInput);
     const evidence = profileEvidenceSchema.parse(evidenceInput);
     const patchKeys = new Set(Object.keys(patch));
@@ -132,9 +138,34 @@ export class JsonUserProfileStore {
         throw new Error(`${key}: 必须引用实际用户消息中的原话；不能引用模型建议或工具输出`);
       }
     }
-    const pending = { id: randomUUID(), createdAt: new Date().toISOString(), patch, evidence };
+    // Corrections update the displayed proposal; unrelated pending fields retain their evidence.
+    const mergedPatch = { ...this.profile.pending?.patch, ...patch };
+    const mergedEvidence = { ...this.profile.pending?.evidence, ...evidence };
+    const confirmed = this.snapshot;
+    const ignoredFields = profileFieldSchema.options.filter(key => {
+      const value = mergedPatch[key];
+      return value !== undefined && (value === null
+        ? this.profile[key] === undefined
+        : confirmed[key] !== undefined && JSON.stringify(value) === JSON.stringify(confirmed[key]));
+    });
+    for (const key of ignoredFields) {
+      delete mergedPatch[key];
+      delete mergedEvidence[key];
+    }
+    if (Object.keys(mergedPatch).length === 0) {
+      if (this.profile.pending) {
+        const { pending: _pending, ...rest } = this.profile;
+        await this.persist(rest);
+      }
+      return { requiresConfirmation: false, ignoredFields, message: "没有需要确认的变更：提交值与已确认画像一致，或要清除的字段已不存在。请继续原任务。" };
+    }
+    // Repeated proposals must not rotate IDs or invalidate an already displayed confirmation.
+    if (JSON.stringify(mergedPatch) === JSON.stringify(this.profile.pending?.patch)) {
+      return { requiresConfirmation: true, ignoredFields, message: this.pendingPrompt! };
+    }
+    const pending = { id: randomUUID(), createdAt: new Date().toISOString(), patch: mergedPatch, evidence: mergedEvidence };
     await this.persist(userProfileSchema.parse({ ...this.profile, pending }));
-    return this.pendingPrompt!;
+    return { requiresConfirmation: true, ignoredFields, message: this.pendingPrompt! };
   }
 
   public get pendingPrompt(): string | undefined {
@@ -146,26 +177,37 @@ export class JsonUserProfileStore {
       const current = currentValue === undefined ? "未设置" : formatProfileValue(field, currentValue);
       return `${index + 1}. ${fieldLabels[field]} (${field})：当前已确认=${current}；候选=${formatProfileValue(field, value)}；引用=${JSON.stringify(pending.evidence[field])}`;
     });
-    return `以下是待核对的画像变更，尚未用于规划：\n${lines.join("\n")}\n请检查字段和值。确认全部请回复“确认画像 ${pending.id} 全部”；只确认部分请回复“确认画像 ${pending.id} 1,2”（填写对应序号）；取消请回复“取消画像 ${pending.id}”。未选字段不会保存；如有错误请直接说明更正内容。`;
+    return `以下是待核对的画像变更，尚未用于规划：\n${lines.join("\n")}\n确认全部请回复“确认”；只确认部分请回复“确认 1,2”（填写对应序号）；取消请回复“取消画像”。如有错误请直接说明更正内容，系统会更新清单。未选字段不会保存；确认成功后继续原任务。\n提案编号：${pending.id}。跨轮次也可使用“确认画像 ${pending.id} 全部”或“取消画像 ${pending.id}”。`;
   }
 
   /** Called only with terminal/runtime user input, never exposed as a model tool. */
-  public async handleUserReply(reply: string): Promise<string | undefined> {
-    const match = reply.trim().match(/^(确认画像|取消画像)\s+(\S+)(?:\s+(.*))?$/u);
-    if (!match) return undefined;
+  public async handleUserReply(reply: string, displayedPrompt?: string): Promise<{ readonly message: string; readonly continueTask: boolean } | undefined> {
+    const text = reply.trim();
     const pending = this.profile.pending;
-    if (!pending || match[2] !== pending.id) return "画像确认编号无效或已过期；没有修改画像。";
-    if (match[1] === "取消画像") {
+    const explicit = text.match(/^(确认画像|取消画像)\s+(\S+)(?:\s+(.*))?$/u);
+    // A short reply is valid only immediately after this exact proposal was displayed.
+    // Session restoration can supply the saved assistant message; another session cannot guess it.
+    const short = pending && displayedPrompt?.endsWith(this.pendingPrompt!)
+      ? text.match(/^(确认|确认全部|全部确认|取消画像|取消)(?:\s+(全部|\d+(?:[,，]\d+)*))?[。！!]?$/u)
+      : null;
+    if (!explicit && !short) return undefined;
+    if (!pending || (explicit && explicit[2] !== pending.id)) {
+      return { message: "画像确认编号无效或已过期；没有修改画像。", continueTask: false };
+    }
+    const action = explicit?.[1] ?? short?.[1];
+    if (action === "取消画像" || action === "取消") {
       const { pending: _pending, ...rest } = this.profile;
       await this.persist(rest);
-      return "已取消待确认的画像变更，原画像未修改。";
+      return { message: "已取消待确认的画像变更，原画像未修改。", continueTask: false };
     }
     // Use displayed insertion order, not schema order, for numbered selections.
     const displayedKeys = Object.keys(pending.patch).map(key => profileFieldSchema.parse(key));
-    const selection = match[3] ?? "";
+    const selection = explicit ? explicit[3] ?? "" : short?.[2] ?? "全部";
     const numbers = selection === "全部" ? displayedKeys.map((_, i) => i + 1)
       : /^\d+(?:[,，]\d+)*$/.test(selection) ? selection.split(/[,，]/).map(Number) : [];
-    if (!numbers.length || numbers.some(n => n < 1 || n > displayedKeys.length)) return "请选择有效字段序号或‘全部’，画像未修改。";
+    if (!numbers.length || numbers.some(n => n < 1 || n > displayedKeys.length)) {
+      return { message: `请选择有效字段序号或“全部”，画像未修改。\n\n${this.pendingPrompt}`, continueTask: false };
+    }
     const { pending: _pending, ...current } = this.profile;
     const next: Record<string, unknown> = { ...current, updatedAt: new Date().toISOString() };
     const confirmations = { ...this.profile.confirmations };
@@ -180,7 +222,7 @@ export class JsonUserProfileStore {
     }
     next.confirmations = confirmations;
     await this.persist(userProfileSchema.parse(next));
-    return `已保存确认的 ${new Set(numbers).size} 个字段，其余候选未保存。待补充：${this.missingFields.join("、") || "无"}。可继续投资规划。`;
+    return { message: `已保存确认的 ${new Set(numbers).size} 个字段，其余候选未保存。待补充：${this.missingFields.join("、") || "无"}。继续原任务。`, continueTask: true };
   }
 
   public toInvestorProfile(): InvestorProfile | undefined {

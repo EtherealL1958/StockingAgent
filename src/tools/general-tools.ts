@@ -12,7 +12,7 @@ const MAX_EXECUTION_MS = 30_000;
 const READ_PARAMETERS = {
   type: "object",
   properties: {
-    path: { type: "string", description: "项目相对路径，例如 skills/a-share-research/SKILL.md 或 reports/2025-q4.txt；不要传绝对路径或 .env" },
+    path: { type: "string", description: "项目相对路径，例如 knowledge/topics/etf-research.md、skills/a-share-research/SKILL.md 或 reports/2025-q4.txt；不要传绝对路径、链接锚点或 .env" },
     offset: { type: "integer", minimum: 1, description: "1-based 起始行，例如 401" },
     limit: { type: "integer", minimum: 1, maximum: MAX_READ_LINES, description: "读取行数，例如 20；默认 400，最大 400" },
   },
@@ -79,9 +79,9 @@ export function buildGeneralTools(cwd = process.cwd(), webSearchProvider: WebSea
   return [
     defineTool({
       name: "read",
-      description: "当你需要查看完整 Skill、文本格式财报（例如 reports/2025-q4.txt）或研究笔记时使用。只接受项目目录内的 UTF-8 文本，不解析 PDF、图片、目录或 .env；默认从第 1 行读取最多 400 行。返回示例字段为 {path:'reports/2025-q4.txt', startLine:1, endLine:20, truncated:false, content:'...'}。",
+      description: "当投资规划、ETF、策略、回测或风险分析需要知识依据时，按系统目录读取相关专题（例如 knowledge/topics/etf-research.md）；不知道选哪个时读取 knowledge/README.md，核查出处时读取 knowledge/sources.md。也用于查看完整 Skill、文本格式财报或研究笔记。只接受项目目录内的 UTF-8 文本，不解析 PDF、图片、目录或 .env；path 不接受网页 URL 或链接锚点。默认从第 1 行读取最多 400 行，不改写正文；返回示例字段为 {path:'knowledge/topics/etf-research.md', startLine:1, endLine:60, truncated:false, content:'...'}。truncated=true 时按 endLine+1 继续读取所需内容；只读取目录不等于已阅读专题。",
       input: z.object({
-        path: z.string().min(1).describe("项目相对路径，例如 skills/a-share-research/SKILL.md 或 reports/2025-q4.txt；不要传 .env 或绝对路径"),
+        path: z.string().min(1).describe("项目相对路径，例如 knowledge/topics/etf-research.md 或 skills/a-share-research/SKILL.md；不要传 .env、绝对路径或链接锚点"),
         offset: z.number().int().positive().optional().describe("1-based 起始行，例如上一页返回 endLine=400 时传 401"),
         limit: z.number().int().positive().max(MAX_READ_LINES).optional().describe("读取行数，默认 400，最大 400；例如只看文件开头可传 20"),
       }).strict(),
